@@ -45,6 +45,14 @@ class SessionStorage:
         return path
 
 
+def serialize_session(session: ResearchSession) -> dict:
+    """Public helper: convert a session to a JSON-safe dict.
+
+    Used by the HTTP API to return a session as JSON without touching disk.
+    """
+    return _to_serializable(session)
+
+
 def _to_serializable(session: ResearchSession) -> dict:
     """Convert a session (nested dataclasses/enums) to JSON-safe primitives."""
     return _convert(dataclasses.asdict(session))

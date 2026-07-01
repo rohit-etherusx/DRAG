@@ -10,11 +10,9 @@ import argparse
 import sys
 
 from research_engine.config import EngineConfig
-from research_engine.domain.models import ResearchRequest, ResearchSession
+from research_engine.domain.models import ResearchSession
 from research_engine.logging_setup import configure_logging, get_logger
-from research_engine.orchestrator.orchestrator import ResearchOrchestrator
-from research_engine.providers.factory import build_llm_provider, build_search_provider
-from research_engine.storage.storage import SessionStorage
+from research_engine.service import run_research
 
 _log = get_logger("cli")
 
@@ -67,19 +65,7 @@ def run(argv: list[str] | None = None) -> ResearchSession:
         log_level=("DEBUG" if args.verbose else None),
     )
     configure_logging(config.log_level)
-
-    request = ResearchRequest(
-        topic=topic,
-        max_subtopics=config.max_subtopics,
-        documents_per_query=config.documents_per_query,
-    )
-    orchestrator = ResearchOrchestrator(
-        config=config,
-        search_provider=build_search_provider(config),
-        llm_provider=build_llm_provider(config),
-        storage=SessionStorage(config.output_dir, config.sessions_dir),
-    )
-    return orchestrator.run(request)
+    return run_research(topic, config)
 
 
 def main(argv: list[str] | None = None) -> int:

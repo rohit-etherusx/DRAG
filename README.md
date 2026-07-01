@@ -268,6 +268,42 @@ down; they lead somewhere real now.
 
 ---
 
+## 🌐 HTTP API (optional)
+
+Prefer talking to the engine over HTTP? There's a thin FastAPI wrapper
+(`research_engine/api.py`) that runs a session and hands you back the whole thing
+as JSON. It's an **optional extra** so the core install stays lean:
+
+```bash
+uv sync --extra api            # installs fastapi + uvicorn
+uv run research-engine-api     # serves on http://127.0.0.1:8000 (RE_API_HOST/RE_API_PORT to change)
+```
+
+Endpoints:
+
+| Method & path | What it does |
+|---------------|--------------|
+| `GET /health` | Liveness + version. |
+| `POST /research` | Runs a full session, returns the serialized session as JSON. |
+| `GET /docs` | Auto-generated Swagger UI (courtesy of FastAPI). |
+
+```bash
+curl -X POST http://127.0.0.1:8000/research \
+  -H "Content-Type: application/json" \
+  -d '{"topic": "Quantum Computing", "max_subtopics": 4}'
+```
+
+Request body: `topic` (required), plus optional `max_subtopics` (1–7),
+`documents_per_query`, `offline`, and `no_llm`. The response is the complete
+session — findings, evidence, entities, relationships, hypotheses, and the report
+(including its Markdown). Empty/invalid input returns `422`; an empty topic that
+slips through returns `400`. The endpoint is synchronous on purpose (FastAPI runs
+it in a worker thread), because a real run is blocking and can take a minute or
+two — so don't fire a thousand at once and act surprised.
+
+It reuses the exact same engine as the CLI (via `service.run_research`), so
+whatever the CLI produces, the API produces — just JSON-shaped.
+
 ## 🧪 Running the tests
 
 ```bash
