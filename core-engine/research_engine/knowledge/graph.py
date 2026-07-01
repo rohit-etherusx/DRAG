@@ -28,6 +28,29 @@ class KnowledgeGraph:
             for a, b in combinations(sorted(set(entity_ids)), 2):
                 self._upsert_relationship(a, b, item.id)
 
+    def add_extracted_relationships(
+        self, relationships: list[tuple[str, str, str, list[str]]]
+    ) -> None:
+        """Add explicit, LLM-extracted relationships to the graph.
+
+        Each tuple is ``(source_name, relation, target_name, evidence_ids)``. The
+        endpoint entities are upserted (so relationships can reference entities not
+        otherwise co-occurring), and the specific relation label overrides the
+        generic co-occurrence ``related_to`` for that entity pair.
+        """
+        for source_name, relation, target_name, evidence_ids in relationships:
+            if not source_name or not target_name:
+                continue
+            ids = evidence_ids or [""]
+            a = b = None
+            for evidence_id in ids:
+                a = self._upsert_entity(source_name, evidence_id)
+                b = self._upsert_entity(target_name, evidence_id)
+            if a is None or b is None or a == b:
+                continue
+            for evidence_id in ids:
+                self._upsert_relationship(a, b, evidence_id, relation=relation)
+
     @property
     def entities(self) -> list[Entity]:
         return list(self._entities.values())
@@ -52,15 +75,28 @@ class KnowledgeGraph:
         if entity is None:
             entity = Entity(id=entity_id, name=name)
             self._entities[entity_id] = entity
-        if evidence_id not in entity.evidence_ids:
+        if evidence_id and evidence_id not in entity.evidence_ids:
             entity.evidence_ids.append(evidence_id)
         return entity_id
 
-    def _upsert_relationship(self, a: str, b: str, evidence_id: str) -> None:
-        rel_id = f"rel-{a}--{b}"
+    def _upsert_relationship(
+        self, a: str, b: str, evidence_id: str, relation: str = "related_to"
+    ) -> None:
+        # Identity is the unordered pair, so co-occurrence and extracted edges for
+        # the same two entities collapse to one relationship (no duplicates).
+        lo, hi = sorted((a, b))
+        rel_id = f"rel-{lo}--{hi}"
         rel = self._relationships.get(rel_id)
         if rel is None:
-            rel = Relationship(id=rel_id, source_entity_id=a, target_entity_id=b)
+            rel = Relationship(
+                id=rel_id, source_entity_id=a, target_entity_id=b, relation=relation
+            )
             self._relationships[rel_id] = rel
-        if evidence_id not in rel.evidence_ids:
+        elif relation != "related_to" and rel.relation == "related_to":
+            # Promote a generic co-occurrence edge to a specific extracted relation,
+            # adopting the extracted direction (source -> target).
+            rel.relation = relation
+            rel.source_entity_id = a
+            rel.target_entity_id = b
+        if evidence_id and evidence_id not in rel.evidence_ids:
             rel.evidence_ids.append(evidence_id)

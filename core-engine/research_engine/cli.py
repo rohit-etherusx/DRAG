@@ -42,6 +42,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable the LLM provider and use deterministic synthesis only.",
     )
     parser.add_argument(
+        "--offline", action="store_true",
+        help="Use the deterministic offline search provider (no network). "
+             "Reproducible, but evidence is synthetic rather than real.",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging."
     )
     return parser
@@ -58,6 +63,7 @@ def run(argv: list[str] | None = None) -> ResearchSession:
         max_subtopics=args.max_subtopics,
         documents_per_query=args.documents_per_query,
         llm_enabled=(False if args.no_llm else None),
+        search_provider=("offline" if args.offline else None),
         log_level=("DEBUG" if args.verbose else None),
     )
     configure_logging(config.log_level)

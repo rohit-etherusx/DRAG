@@ -33,16 +33,24 @@ persistence, guaranteeing a report is reproducible from stored data.
 - **Task graph** — a DAG with `topological_order()`; detects cycles and unknown
   dependencies. Ties break by insertion order for deterministic execution.
 - **Collection** — pure acquisition; delegates to a `SearchProvider` and stamps
-  provenance. No reasoning.
-- **Processing** — splits content into claims, de-duplicates, extracts candidate
-  entities, and flags negation-based contradictions. Every evidence item keeps
-  its `source_id` and `task_id`.
-- **Knowledge graph** — upserts entities and infers `related_to` relationships
-  from entity co-occurrence within an evidence item.
-- **Reasoning** — one finding per collection task (confidence scaled by source
-  diversity, capped below certainty), hypotheses from the strongest
-  relationships, knowledge gaps, and an executive summary (LLM-optional with a
-  deterministic fallback).
+  provenance. No reasoning. The default provider is a `CompositeSearchProvider`
+  fanning out across real no-key sources (Wikipedia + arXiv + DuckDuckGo), each
+  isolated so one failure never breaks collection; `--offline` selects the
+  deterministic stub.
+- **Processing** — delegates extraction to a `ClaimExtractor` (LLM-backed over
+  real source text — producing claims, entities, and relationships — or a
+  deterministic heuristic fallback), then owns the strategy-independent concerns:
+  global de-duplication, id assignment, provenance, and negation-based
+  contradiction flagging. Every evidence item keeps its `source_id` and `task_id`.
+- **Knowledge graph** — upserts entities and relationships. Co-occurrence within
+  an evidence item yields generic `related_to` edges; LLM-extracted relationships
+  promote those to typed, directed relations. Edge identity is the unordered
+  entity pair, so the two never duplicate.
+- **Reasoning** — one finding per collection task, synthesized from that angle's
+  evidence; hypotheses grounded in the findings and strongest relationships;
+  knowledge gaps; and an executive summary. Each LLM path (finding, hypothesis,
+  summary) uses a light retry and has a deterministic fallback; confidence is
+  scaled by source diversity and capped below certainty.
 - **Report** — renders every section required by `PROJECT.md`, preserving
   citation links from findings → evidence → sources.
 - **Storage** — writes `report/<topic>_report.md` and a JSON session snapshot.
@@ -62,8 +70,11 @@ without changing callers.
 
 ## Reproducibility
 
-Every default is deterministic: planning, the offline search provider, evidence
-ordering, entity ids (slugged names), and confidence math. Given identical
-inputs and providers, the engine produces identical research content. Only
-timestamps and the optional LLM narrative are non-deterministic, and neither is
-part of the structured evidence.
+Live runs are inherently non-deterministic: real sources change and the LLM
+varies. Reproducibility is therefore a *mode*, not the default. Running with
+`--offline --no-llm` makes the whole pipeline deterministic — planning, the
+offline search provider, extraction, evidence ordering, entity ids (slugged
+names), and confidence math — so given identical inputs the engine produces
+identical research content. This is the mode the test suite uses. The structural
+guarantee holds in every mode: a report is always fully reproducible from its
+persisted session snapshot, since the snapshot stores the exact evidence used.

@@ -1,10 +1,11 @@
 """Provider selection.
 
 Chooses concrete providers from configuration, keeping construction logic out of
-the orchestrator. The offline search provider is always used in v0.1 (real web
-providers are a future objective); the LLM provider is the configured provider
-(OpenRouter by default) when available and enabled, otherwise a null provider so
-the pipeline degrades cleanly to deterministic synthesis.
+the orchestrator. The search provider is a composite of real no-key sources
+(Wikipedia + arXiv + DuckDuckGo) by default, or the deterministic offline stub
+when ``search_provider == "offline"``. The LLM provider is the configured
+provider (OpenRouter by default) when available and enabled, otherwise a null
+provider so the pipeline degrades cleanly to deterministic synthesis.
 """
 from __future__ import annotations
 
@@ -13,13 +14,33 @@ from research_engine.logging_setup import get_logger
 from research_engine.providers.base import LLMProvider, SearchProvider
 from research_engine.providers.offline import NullLLMProvider, OfflineSearchProvider
 from research_engine.providers.openrouter_provider import OpenRouterProvider
+from research_engine.providers.sources.arxiv import ArxivSearchProvider
+from research_engine.providers.sources.composite import CompositeSearchProvider
+from research_engine.providers.sources.duckduckgo import DuckDuckGoSearchProvider
+from research_engine.providers.sources.wikipedia import WikipediaSearchProvider
 
 _log = get_logger("providers.factory")
 
 
 def build_search_provider(config: EngineConfig) -> SearchProvider:
-    """Return the search provider for a run."""
-    return OfflineSearchProvider()
+    """Return the search provider for a run.
+
+    "offline" selects the deterministic local-knowledge stub (reproducible, no
+    network). Any other value ("web", the default) composes the real no-key
+    sources so evidence is drawn from multiple independent providers.
+    """
+    if config.search_provider == "offline":
+        _log.info("Using offline deterministic search provider")
+        return OfflineSearchProvider()
+    provider = CompositeSearchProvider(
+        [
+            WikipediaSearchProvider(),
+            ArxivSearchProvider(),
+            DuckDuckGoSearchProvider(),
+        ]
+    )
+    _log.info("Using web search provider: %s", provider.name)
+    return provider
 
 
 def build_llm_provider(config: EngineConfig) -> LLMProvider:

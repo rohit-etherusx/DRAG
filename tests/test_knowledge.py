@@ -46,6 +46,32 @@ class KnowledgeGraphTests(unittest.TestCase):
         ])
         self.assertEqual(graph.relationships, [])
 
+    def test_extracted_relationship_promotes_cooccurrence_label(self):
+        graph = KnowledgeGraph()
+        graph.build([
+            Evidence(id="ev-1", claim="c", source_id="s", task_id="t",
+                     entities=["Cas9", "DNA"]),
+        ])
+        # Co-occurrence created a generic related_to edge...
+        self.assertEqual(graph.relationships[0].relation, "related_to")
+        graph.add_extracted_relationships([("Cas9", "cuts", "DNA", ["ev-1"])])
+        # ...which the extracted relation promotes, without duplicating the edge.
+        self.assertEqual(len(graph.relationships), 1)
+        self.assertEqual(graph.relationships[0].relation, "cuts")
+
+    def test_extracted_relationship_creates_new_entities(self):
+        graph = KnowledgeGraph()
+        graph.add_extracted_relationships([("Doudna", "co-developed", "CRISPR", ["ev-9"])])
+        names = {e.name for e in graph.entities}
+        self.assertEqual(names, {"Doudna", "CRISPR"})
+        self.assertEqual(len(graph.relationships), 1)
+        self.assertEqual(graph.relationships[0].relation, "co-developed")
+
+    def test_extracted_self_relationship_is_ignored(self):
+        graph = KnowledgeGraph()
+        graph.add_extracted_relationships([("X", "is", "X", ["ev-1"])])
+        self.assertEqual(graph.relationships, [])
+
 
 if __name__ == "__main__":
     unittest.main()

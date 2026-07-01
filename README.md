@@ -10,9 +10,10 @@ This repository is the single source of truth. See `PROJECT.md` (vision),
 `ARCHITECTURE.md` (design), `OBJECTIVE.md` (current milestone), and `TASKS.md`
 (implementation status).
 
-**Status:** Research Engine **v0.1** — a complete, working end-to-end pipeline
-(the MVP vertical slice). Every major subsystem exists in a minimal but working
-form.
+**Status:** Research Engine **v0.2** — grounded research. The pipeline collects
+from real, no-key sources (Wikipedia + arXiv + DuckDuckGo) and uses an LLM to
+extract source-grounded claims/entities and synthesize findings. A deterministic
+offline mode (`--offline`) is preserved for reproducible, network-free runs.
 
 ---
 
@@ -87,16 +88,22 @@ it, and every report is reproducible from its stored session snapshot.
 Data sources and language models sit behind interfaces (`SearchProvider`,
 `LLMProvider`), so new backends are added without touching the core engine.
 
-- **Search (default):** `OfflineSearchProvider` — a deterministic *local
-  knowledge source*. It makes the engine runnable and reproducible anywhere with
-  zero setup. It is a placeholder for real web/API providers and is clearly
-  attributed as such in every report.
+- **Search (default):** a `CompositeSearchProvider` fanning out across real,
+  no-key sources — **Wikipedia** (clean article extracts), **arXiv** (paper
+  abstracts), and **DuckDuckGo** (open-web page text) — merged and de-duplicated,
+  with each source isolated so one failing never breaks a run. Use `--offline` to
+  switch to the deterministic `OfflineSearchProvider` (a *local knowledge source*
+  stub) for reproducible, network-free runs.
 - **LLM (default, optional at runtime):** `OpenRouterProvider` uses OpenRouter's
   OpenAI-compatible API and activates automatically when an `OPENROUTER_API_KEY`
-  is present. It is used only to enrich the executive summary; without a key a
-  deterministic summary is produced (the engine never fails for lack of an LLM).
+  is present. It powers the reasoning pipeline: **claim, entity, and relationship
+  extraction** from real source text, plus **finding, hypothesis, and summary
+  synthesis**. Nondeterministic model output is handled with a light retry,
+  hardened JSON parsing, and a deterministic fallback, so a run never fails for
+  lack of (or a hiccup from) the LLM; `--no-llm` forces the deterministic path.
   Copy `.env.example` to `.env` and set `OPENROUTER_API_KEY` (optionally
-  `OPENROUTER_MODEL`, default `openai/gpt-4o-mini`).
+  `OPENROUTER_MODEL`, default `openai/gpt-4o-mini`; prefer a capable
+  instruction-following model for best extraction quality).
 
 ## Configuration
 
@@ -107,10 +114,13 @@ overriding the previous. Engine settings use `RE_*` variables (e.g.
 `RE_LLM_MODEL`, `RE_LOG_LEVEL`); the LLM provider also reads `OPENROUTER_API_KEY`,
 `OPENROUTER_MODEL`, and `OPENROUTER_BASE_URL`. See `.env.example`.
 
-## Known limitations (v0.1)
+## Known limitations (v0.2)
 
-The offline search provider generates heuristic, self-referential evidence to
-keep the pipeline reproducible offline; it is not externally-verified signal.
-Entity extraction and contradiction detection are deliberately simple heuristics.
-These are isolated behind interfaces so a future objective can replace them —
-see the *Technical Debt* and *Next Recommended Objective* sections of `TASKS.md`.
+Evidence is now real and cited, but quality caveats remain: arXiv's `all:` search
+can surface tangential papers, DuckDuckGo HTML scraping is inherently brittle
+(best-effort, fails closed), and claims are cited but **not yet cross-verified**
+across sources (confidence is source-diversity based, not agreement-based).
+Contradiction detection remains a simple negation heuristic. These are isolated
+behind interfaces so a future objective can strengthen them — see the *Technical
+Debt* and *Next Recommended Objective* sections of `TASKS.md`. Live runs consume
+LLM tokens (~15–40k/run); `--offline` and `--no-llm` are zero-cost paths.

@@ -15,4 +15,4 @@ through the shared domain models in :mod:`research_engine.domain.models`:
 * :mod:`research_engine.providers` — pluggable search and LLM providers.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -8,42 +8,69 @@ to its originating source and task.
 from __future__ import annotations
 
 from research_engine.domain.models import Contradiction, Evidence, RawDocument
-from research_engine.utils import extract_entity_names, normalize_claim, split_sentences
+from research_engine.processing.extraction import ClaimExtractor, HeuristicClaimExtractor
+from research_engine.utils import normalize_claim
 
 _NEGATIONS = {"not", "no", "never", "cannot", "without", "lacks", "fails"}
 
 
 class EvidenceProcessor:
-    """Extracts and normalizes evidence from raw documents."""
+    """Extracts and normalizes evidence from raw documents.
 
-    def __init__(self, topic_keywords: list[str] | None = None) -> None:
-        self._topic_keywords = topic_keywords or []
+    Claim extraction is delegated to a :class:`ClaimExtractor` (heuristic by
+    default, LLM-backed when configured). The processor owns the concerns that
+    are strategy-independent: global de-duplication, id assignment, and
+    provenance. This keeps every evidence item traceable to its source and task
+    regardless of how claims were extracted.
+    """
+
+    def __init__(
+        self,
+        topic_keywords: list[str] | None = None,
+        extractor: ClaimExtractor | None = None,
+    ) -> None:
+        self._extractor = extractor or HeuristicClaimExtractor(topic_keywords)
         self._counter = 0
+        self._seen: set[str] = set()
+        #: LLM-extracted relationships with provenance, accumulated across all
+        #: ``process`` calls: (source, relation, target, evidence_ids).
+        self._relationships: list[tuple[str, str, str, list[str]]] = []
+
+    @property
+    def relationships(self) -> list[tuple[str, str, str, list[str]]]:
+        """Relationships extracted so far, tagged with supporting evidence ids."""
+        return self._relationships
 
     def process(self, documents: list[RawDocument]) -> list[Evidence]:
         """Return de-duplicated evidence extracted from ``documents``.
 
-        De-duplication is global across the supplied documents: a claim already
-        seen (case/whitespace-insensitive) is skipped so repeated statements
-        don't inflate confidence.
+        De-duplication is global across every document processed by this
+        instance: a claim already seen (case/whitespace-insensitive) is skipped
+        so repeated statements don't inflate confidence. Any relationships the
+        extractor reports are accumulated (with provenance) on :attr:`relationships`.
         """
         evidence: list[Evidence] = []
-        seen: set[str] = set()
         for document in documents:
-            for sentence in split_sentences(document.content):
-                key = normalize_claim(sentence)
-                if not key or key in seen:
+            result = self._extractor.extract(document)
+            doc_evidence_ids: list[str] = []
+            for claim in result.claims:
+                key = normalize_claim(claim.text)
+                if not key or key in self._seen:
                     continue
-                seen.add(key)
+                self._seen.add(key)
                 self._counter += 1
-                evidence.append(
-                    Evidence(
-                        id=f"ev-{self._counter}",
-                        claim=sentence,
-                        source_id=document.source.id,
-                        task_id=document.task_id,
-                        entities=extract_entity_names(sentence, self._topic_keywords),
-                    )
+                item = Evidence(
+                    id=f"ev-{self._counter}",
+                    claim=claim.text,
+                    source_id=document.source.id,
+                    task_id=document.task_id,
+                    entities=claim.entities,
+                )
+                evidence.append(item)
+                doc_evidence_ids.append(item.id)
+            for rel in result.relationships:
+                self._relationships.append(
+                    (rel.source, rel.relation, rel.target, list(doc_evidence_ids))
                 )
         return evidence
 

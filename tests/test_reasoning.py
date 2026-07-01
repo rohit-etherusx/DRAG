@@ -4,7 +4,27 @@ from tests import _path  # noqa: F401
 
 from research_engine.domain.models import Evidence, Task, TaskKind
 from research_engine.knowledge.graph import KnowledgeGraph
+from research_engine.providers.base import LLMProvider
 from research_engine.reasoning.analyzer import ReasoningEngine
+
+
+class _ScriptedLLM(LLMProvider):
+    """Returns canned text based on which system prompt is used."""
+
+    name = "scripted"
+
+    def __init__(self, responses: dict[str, str]):
+        self._responses = responses
+
+    @property
+    def available(self):
+        return True
+
+    def generate(self, prompt, system=None):
+        for key, value in self._responses.items():
+            if key in (system or ""):
+                return value
+        return None
 
 
 class ReasoningTests(unittest.TestCase):
@@ -60,6 +80,35 @@ class ReasoningTests(unittest.TestCase):
     def test_deterministic_summary_without_llm(self):
         result = self._analyze()
         self.assertIn("X", result.executive_summary)
+
+    def test_llm_hypotheses_used_when_available(self):
+        llm = _ScriptedLLM({
+            "hypotheses": '["Alpha may causally drive Beta under condition C."]',
+            "synthesize grounded research findings": "Alpha and Beta are linked.",
+        })
+        result = ReasoningEngine(llm=llm).analyze(
+            topic="X",
+            tasks=self.tasks,
+            evidence=self.evidence,
+            knowledge_graph=self.graph,
+            contradictions=[],
+            documents_per_query=3,
+        )
+        self.assertTrue(any("causally drive" in h.statement for h in result.hypotheses))
+
+    def test_llm_hypotheses_fall_back_to_deterministic(self):
+        # LLM returns unusable hypothesis output -> deterministic hypotheses.
+        llm = _ScriptedLLM({"hypotheses": "not json"})
+        result = ReasoningEngine(llm=llm).analyze(
+            topic="X",
+            tasks=self.tasks,
+            evidence=self.evidence,
+            knowledge_graph=self.graph,
+            contradictions=[],
+            documents_per_query=3,
+        )
+        self.assertTrue(result.hypotheses)
+        self.assertIn("meaningful relationship", result.hypotheses[0].statement)
 
     def test_low_source_diversity_flags_open_question(self):
         # Only one source -> distinct_sources < 2 for the collect task.

@@ -79,6 +79,9 @@ class EngineConfig:
     max_subtopics: int = 6
     #: Number of documents the search provider returns per query.
     documents_per_query: int = 3
+    #: Which search provider to use: "web" (real no-key sources) or "offline"
+    #: (deterministic local-knowledge stub, used for reproducible/offline runs).
+    search_provider: str = "web"
     #: Whether to use a live LLM provider when one is available.
     llm_enabled: bool = True
     #: Identifier of the active LLM provider (extension seam; OpenRouter default).
@@ -107,6 +110,7 @@ class EngineConfig:
             documents_per_query=_env_int(
                 "RE_DOCUMENTS_PER_QUERY", cls.documents_per_query
             ),
+            search_provider=os.environ.get("RE_SEARCH_PROVIDER", cls.search_provider),
             llm_enabled=_env_bool("RE_LLM_ENABLED", cls.llm_enabled),
             llm_provider=os.environ.get("RE_LLM_PROVIDER", cls.llm_provider),
             llm_model=_env_first(("RE_LLM_MODEL", "OPENROUTER_MODEL"), cls.llm_model),

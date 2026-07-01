@@ -20,6 +20,7 @@ from research_engine.domain.models import (
 from research_engine.knowledge.graph import KnowledgeGraph
 from research_engine.logging_setup import get_logger
 from research_engine.planner.planner import ResearchPlanner
+from research_engine.processing.extraction import build_extractor
 from research_engine.processing.processor import EvidenceProcessor
 from research_engine.providers.base import LLMProvider, SearchProvider
 from research_engine.reasoning.analyzer import ReasoningEngine
@@ -66,7 +67,13 @@ class ResearchOrchestrator:
         session.tasks = graph.topological_order()
 
         collector = EvidenceCollector(self._search, request.documents_per_query)
-        processor = EvidenceProcessor(topic_keywords=keywords(request.topic))
+        extractor = build_extractor(
+            self._llm,
+            request.topic,
+            keywords(request.topic),
+            enabled=self._config.llm_enabled,
+        )
+        processor = EvidenceProcessor(extractor=extractor)
         sources_by_id: dict[str, Source] = {}
 
         # Execute collection tasks in dependency order.
@@ -90,9 +97,11 @@ class ResearchOrchestrator:
         session.sources = list(sources_by_id.values())
         session.contradictions = processor.detect_contradictions(session.evidence)
 
-        # Build the knowledge graph.
+        # Build the knowledge graph: entity co-occurrence plus any explicit
+        # relationships the LLM extracted from the sources.
         knowledge_graph = KnowledgeGraph()
         knowledge_graph.build(session.evidence)
+        knowledge_graph.add_extracted_relationships(processor.relationships)
         session.entities = knowledge_graph.entities
         session.relationships = knowledge_graph.relationships
 
