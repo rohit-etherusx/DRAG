@@ -1,0 +1,39 @@
+[project]
+name = "research-engine"
+version = "0.1.0"
+description = "Domain-agnostic autonomous research engine"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# Runtime dependencies for the current architecture:
+#   - python-dotenv: load configuration/secrets from a local .env file.
+#   - openai:        OpenAI-compatible client used by the default OpenRouter
+#                    LLM provider. The LLM is optional at runtime — the engine
+#                    falls back to deterministic synthesis when no API key is
+#                    configured — but the dependency is declared so the default
+#                    provider works out of the box.
+dependencies = [
+    "python-dotenv>=1.0",
+    "openai>=1.0",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+research-engine = "research_engine.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# The importable package lives under core-engine/ (see ARCHITECTURE.md); tell
+# both setuptools and uv where to find it.
+[tool.setuptools]
+package-dir = { "" = "core-engine" }
+
+[tool.setuptools.packages.find]
+where = ["core-engine"]
+
+[tool.uv]
+package = true

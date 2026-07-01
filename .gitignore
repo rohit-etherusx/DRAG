@@ -1,0 +1,45 @@
+# ---- Secrets & local configuration ----
+.env
+.env.*
+!.env.example
+
+# ---- Generated research artifacts (reproducible from a single command) ----
+/report/
+/sessions/
+
+# ---- Python bytecode / caches ----
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Packaging / build ----
+*.egg-info/
+build/
+dist/
+wheels/
+*.egg
+
+# ---- Virtual environments / uv ----
+.venv/
+venv/
+env/
+# uv.lock is intentionally committed for reproducible installs.
+
+# ---- Editors / OS ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+
+# --  claude code design files  -- 
+CLAUDE.md
+instructions.md
+OBJECTIVE.md
+PROJECT.md
+ROADMAP.md
+TASKS.md
+ARCHITECTURE.md
