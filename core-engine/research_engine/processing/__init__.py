@@ -1,1 +1,1 @@
-"""Converts raw information into structured, traceable evidence."""
+"""Passage extraction, typed claim extraction, and claim normalization."""

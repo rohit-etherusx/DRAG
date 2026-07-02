@@ -1,36 +1,68 @@
+import json
 import unittest
 
 from tests import _path  # noqa: F401
 
-from research_engine.domain.models import RawDocument, Source
+from research_engine.domain.models import ClaimType, Evidence, RawDocument, Source
 from research_engine.processing.extraction import (
     HeuristicClaimExtractor,
     LLMClaimExtractor,
     build_extractor,
+    classify_claim,
 )
 from research_engine.providers.base import LLMProvider
 
 
-class _FakeLLM(LLMProvider):
-    name = "fake"
-
-    def __init__(self, response, available=True):
-        self._response = response
-        self._available = available
-
-    @property
-    def available(self):
-        return self._available
-
-    def generate(self, prompt, system=None):
-        return self._response
+def _doc(content="Solar power grew in 2023. It is clean."):
+    return RawDocument(
+        id="doc-1",
+        query="q",
+        task_id="collect-1",
+        title="Solar",
+        content=content,
+        source=Source(id="src-1", title="t", provider="p"),
+    )
 
 
-class _SequencedLLM(LLMProvider):
-    name = "sequenced"
+def _evidence(passage, evidence_id="ev-1"):
+    return Evidence(
+        id=evidence_id, passage=passage, document_id="doc-1", source_id="src-1",
+        subquestion_id="sq-1",
+    )
+
+
+class ClassifyClaimTests(unittest.TestCase):
+    def test_types_are_classified_deterministically(self):
+        cases = {
+            "What remains unknown about qubit decoherence?": ClaimType.OPEN_QUESTION,
+            "Quantum computing is defined as computation with qubits.": ClaimType.DEFINITION,
+            "The model assumes ideal gas behavior.": ClaimType.ASSUMPTION,
+            "A known limitation is decoherence noise.": ClaimType.LIMITATION,
+            "The standard method uses error-correcting codes.": ClaimType.METHOD,
+            "The transformer architecture was introduced in 2017.": ClaimType.DATE,
+            "The system achieves 45% efficiency.": ClaimType.NUMERICAL,
+            "Solar power is popular across many regions.": ClaimType.FACT,
+        }
+        for text, expected in cases.items():
+            self.assertEqual(classify_claim(text), expected, msg=text)
+
+
+class HeuristicExtractorTests(unittest.TestCase):
+    def test_extracts_typed_claims_per_sentence_with_provenance(self):
+        extractor = HeuristicClaimExtractor(["solar"])
+        evidence = _evidence("Solar power grew 12% in 2023. Solar Energy is clean.")
+        claims = extractor.extract(_doc(), [evidence])
+        self.assertEqual(len(claims), 2)
+        self.assertEqual(claims[0].claim_type, ClaimType.DATE)  # year outranks number
+        self.assertTrue(all(c.evidence_id == "ev-1" for c in claims))
+        self.assertIn("Solar Energy", claims[1].entities)
+
+
+class _StubLLM(LLMProvider):
+    name = "stub"
 
     def __init__(self, responses):
-        self._responses = responses
+        self._responses = list(responses)
         self.calls = 0
 
     @property
@@ -38,123 +70,90 @@ class _SequencedLLM(LLMProvider):
         return True
 
     def generate(self, prompt, system=None):
-        response = self._responses[min(self.calls, len(self._responses) - 1)]
         self.calls += 1
-        return response
-
-
-def _doc(content="Alpha is real. Beta follows Alpha."):
-    return RawDocument(
-        id="d1",
-        query="q",
-        task_id="collect-1",
-        title="Title",
-        content=content,
-        source=Source(id="src-1", title="t", provider="test"),
-    )
-
-
-class HeuristicExtractorTests(unittest.TestCase):
-    def test_splits_sentences(self):
-        result = HeuristicClaimExtractor().extract(_doc())
-        self.assertEqual(len(result.claims), 2)
-        self.assertEqual(result.claims[0].text, "Alpha is real.")
-        self.assertEqual(result.relationships, [])
+        return self._responses.pop(0) if self._responses else None
 
 
 class LLMExtractorTests(unittest.TestCase):
-    def test_parses_claims_and_relationships(self):
-        response = (
-            'Here you go: {"claims": [{"claim": "Qubits enable superposition.", '
-            '"entities": ["Qubits", "superposition"]}], '
-            '"relationships": [{"source": "Qubits", "relation": "exhibit", '
-            '"target": "superposition"}]} done'
+    def _payload(self):
+        return json.dumps(
+            {
+                "claims": [
+                    {
+                        "claim": "Solar capacity grew 12% in 2023.",
+                        "type": "numerical",
+                        "entities": ["Solar capacity"],
+                        "passage": 1,
+                    },
+                    {
+                        "claim": "Solar power is a renewable energy source.",
+                        "type": "definition",
+                        "entities": ["Solar power"],
+                        "passage": 0,
+                    },
+                ]
+            }
         )
-        extractor = LLMClaimExtractor(_FakeLLM(response), "quantum", HeuristicClaimExtractor())
-        result = extractor.extract(_doc())
-        self.assertEqual(len(result.claims), 1)
-        self.assertEqual(result.claims[0].text, "Qubits enable superposition.")
-        self.assertIn("Qubits", result.claims[0].entities)
-        self.assertEqual(len(result.relationships), 1)
-        self.assertEqual(result.relationships[0].relation, "exhibit")
-        self.assertEqual(result.relationships[0].source, "Qubits")
 
-    def test_falls_back_on_bad_json(self):
+    def test_parses_typed_claims_and_maps_passages(self):
+        llm = _StubLLM([self._payload()])
         extractor = LLMClaimExtractor(
-            _FakeLLM("not json at all"), "topic", HeuristicClaimExtractor()
+            llm, "solar", fallback=HeuristicClaimExtractor()
         )
-        result = extractor.extract(_doc())
-        # Fallback = heuristic sentence splitting -> 2 claims.
-        self.assertEqual(len(result.claims), 2)
-
-    def test_falls_back_when_unavailable(self):
-        extractor = LLMClaimExtractor(
-            _FakeLLM("{}", available=False), "topic", HeuristicClaimExtractor()
-        )
-        result = extractor.extract(_doc())
-        self.assertEqual(len(result.claims), 2)
-
-    def test_falls_back_when_no_claims(self):
-        # Well-formed object but empty claims -> unusable -> heuristic fallback.
-        extractor = LLMClaimExtractor(
-            _FakeLLM('{"claims": [], "relationships": []}'), "t", HeuristicClaimExtractor()
-        )
-        result = extractor.extract(_doc())
-        self.assertEqual(len(result.claims), 2)
-
-    def test_non_list_entities_do_not_crash(self):
-        response = '{"claims": [{"claim": "X happens.", "entities": "oops"}]}'
-        extractor = LLMClaimExtractor(_FakeLLM(response), "t", HeuristicClaimExtractor())
-        result = extractor.extract(_doc())
-        self.assertEqual(len(result.claims), 1)
-        self.assertEqual(result.claims[0].entities, [])
+        evidence = [_evidence("First passage.", "ev-1"), _evidence("Second.", "ev-2")]
+        claims = extractor.extract(_doc(), evidence)
+        self.assertEqual(len(claims), 2)
+        self.assertEqual(claims[0].claim_type, ClaimType.NUMERICAL)
+        self.assertEqual(claims[0].evidence_id, "ev-2")  # passage index 1
+        self.assertEqual(claims[1].evidence_id, "ev-1")
 
     def test_parses_fenced_json(self):
-        response = (
-            "```json\n"
-            '{"claims": [{"claim": "Y is true.", "entities": ["Y"]}], '
-            '"relationships": []}\n'
-            "```"
+        fenced = "```json\n" + self._payload() + "\n```"
+        llm = _StubLLM([fenced])
+        extractor = LLMClaimExtractor(llm, "solar", fallback=HeuristicClaimExtractor())
+        claims = extractor.extract(_doc(), [_evidence("p")])
+        self.assertEqual(len(claims), 2)
+
+    def test_unknown_type_defaults_to_fact(self):
+        payload = json.dumps(
+            {"claims": [{"claim": "X happened.", "type": "banana", "passage": 0}]}
         )
-        extractor = LLMClaimExtractor(_FakeLLM(response), "t", HeuristicClaimExtractor())
-        result = extractor.extract(_doc())
-        self.assertEqual(len(result.claims), 1)
-        self.assertEqual(result.claims[0].text, "Y is true.")
+        llm = _StubLLM([payload])
+        extractor = LLMClaimExtractor(llm, "solar", fallback=HeuristicClaimExtractor())
+        claims = extractor.extract(_doc(), [_evidence("p")])
+        self.assertEqual(claims[0].claim_type, ClaimType.FACT)
+
+    def test_retries_then_falls_back_to_heuristic(self):
+        llm = _StubLLM(["garbage", "more garbage"])
+        extractor = LLMClaimExtractor(
+            llm, "solar", fallback=HeuristicClaimExtractor(), attempts=2
+        )
+        claims = extractor.extract(_doc(), [_evidence("Solar is clean.")])
+        self.assertEqual(llm.calls, 2)
+        self.assertTrue(claims)  # heuristic fallback still produced claims
 
     def test_retries_then_succeeds(self):
-        # First attempt unusable, second attempt valid -> LLM result (not fallback).
-        seq = _SequencedLLM([
-            "garbage",
-            '{"claims": [{"claim": "Recovered.", "entities": []}], "relationships": []}',
-        ])
-        extractor = LLMClaimExtractor(seq, "t", HeuristicClaimExtractor(), attempts=2)
-        result = extractor.extract(_doc())
-        self.assertEqual(seq.calls, 2)
-        self.assertEqual(len(result.claims), 1)
-        self.assertEqual(result.claims[0].text, "Recovered.")
-
-    def test_drops_self_referential_relationship(self):
-        response = (
-            '{"claims": [{"claim": "A relates to A.", "entities": ["A"]}], '
-            '"relationships": [{"source": "A", "relation": "is", "target": "A"}]}'
+        llm = _StubLLM(["garbage", self._payload()])
+        extractor = LLMClaimExtractor(
+            llm, "solar", fallback=HeuristicClaimExtractor(), attempts=2
         )
-        extractor = LLMClaimExtractor(_FakeLLM(response), "t", HeuristicClaimExtractor())
-        result = extractor.extract(_doc())
-        self.assertEqual(result.relationships, [])
+        claims = extractor.extract(_doc(), [_evidence("p1"), _evidence("p2", "ev-2")])
+        self.assertEqual(len(claims), 2)
 
 
 class BuildExtractorTests(unittest.TestCase):
-    def test_selects_llm_when_available(self):
-        extractor = build_extractor(_FakeLLM("[]"), "topic", enabled=True)
+    def test_prefers_llm_when_available(self):
+        extractor = build_extractor(_StubLLM([]), "topic")
         self.assertIsInstance(extractor, LLMClaimExtractor)
 
-    def test_heuristic_when_disabled(self):
-        extractor = build_extractor(_FakeLLM("[]"), "topic", enabled=False)
-        self.assertIsInstance(extractor, HeuristicClaimExtractor)
-
-    def test_heuristic_when_no_llm(self):
-        extractor = build_extractor(None, "topic", enabled=True)
-        self.assertIsInstance(extractor, HeuristicClaimExtractor)
+    def test_heuristic_when_disabled_or_missing(self):
+        self.assertIsInstance(
+            build_extractor(None, "topic"), HeuristicClaimExtractor
+        )
+        self.assertIsInstance(
+            build_extractor(_StubLLM([]), "topic", enabled=False),
+            HeuristicClaimExtractor,
+        )
 
 
 if __name__ == "__main__":

@@ -2,130 +2,219 @@ import unittest
 
 from tests import _path  # noqa: F401
 
-from research_engine.domain.models import Evidence, Task, TaskKind
-from research_engine.knowledge.graph import KnowledgeGraph
-from research_engine.providers.base import LLMProvider
+from research_engine.domain.models import (
+    Claim,
+    ClaimType,
+    Contradiction,
+    Evidence,
+    ResearchPlan,
+    Source,
+    SubQuestion,
+    VerificationStatus,
+)
+from research_engine.knowledge.graph import EvidenceGraph
 from research_engine.reasoning.analyzer import ReasoningEngine
 
 
-class _ScriptedLLM(LLMProvider):
-    """Returns canned text based on which system prompt is used."""
-
-    name = "scripted"
-
-    def __init__(self, responses: dict[str, str]):
-        self._responses = responses
-
-    @property
-    def available(self):
-        return True
-
-    def generate(self, prompt, system=None):
-        for key, value in self._responses.items():
-            if key in (system or ""):
-                return value
-        return None
+def _plan(is_question=False, subquestions=2):
+    return ResearchPlan(
+        objective="Understand solar storage",
+        question="How is solar energy stored?" if is_question else "Solar storage",
+        is_question=is_question,
+        subject="solar storage",
+        subquestions=[
+            SubQuestion(id=f"sq-{i}", question=f"Subquestion {i}?")
+            for i in range(1, subquestions + 1)
+        ],
+    )
 
 
-class ReasoningTests(unittest.TestCase):
-    def setUp(self):
-        self.tasks = [
-            Task(id="collect-1", description="d", kind=TaskKind.COLLECT,
-                 query="Overview of X"),
-            Task(id="synthesize-1", description="s", kind=TaskKind.SYNTHESIZE,
-                 query="X", depends_on=["collect-1"]),
-        ]
-        self.evidence = [
-            Evidence(id="ev-1", claim="X involves Alpha and Beta.",
-                     source_id="src-1", task_id="collect-1",
-                     entities=["Alpha", "Beta"]),
-            Evidence(id="ev-2", claim="Alpha supports Beta.",
-                     source_id="src-2", task_id="collect-1",
-                     entities=["Alpha", "Beta"]),
-        ]
-        self.graph = KnowledgeGraph()
-        self.graph.build(self.evidence)
+def _claim(cid, text, subquestion_ids, sources=1, claim_type=ClaimType.FACT,
+           agreement=0.0, contradicts=None):
+    claim = Claim(
+        id=cid, text=text, claim_type=claim_type,
+        evidence_ids=[f"ev-{cid}"],
+        source_ids=[f"src-{i}" for i in range(1, sources + 1)],
+        subquestion_ids=list(subquestion_ids),
+        supporting_sources=sources,
+        independent_domains=sources,
+        agreement=agreement,
+        contradicts=contradicts or [],
+    )
+    claim.status = (
+        VerificationStatus.CONTRADICTED if claim.contradicts
+        else VerificationStatus.CORROBORATED if sources >= 2
+        else VerificationStatus.SINGLE_SOURCE
+    )
+    return claim
 
-    def _analyze(self, docs_per_query=3):
-        return ReasoningEngine(llm=None).analyze(
-            topic="X",
-            tasks=self.tasks,
-            evidence=self.evidence,
-            knowledge_graph=self.graph,
-            contradictions=[],
-            documents_per_query=docs_per_query,
+
+def _sources(n):
+    return {
+        f"src-{i}": Source(
+            id=f"src-{i}", title="t", provider="p",
+            domain=f"d{i}.org", authority=0.7,
         )
+        for i in range(1, n + 1)
+    }
 
-    def test_produces_one_finding_per_collect_task(self):
-        result = self._analyze()
+
+def _evidence_for(claims):
+    return [
+        Evidence(id=f"ev-{c.id}", passage=c.text, document_id="doc-1",
+                 source_id=c.source_ids[0] if c.source_ids else "src-1",
+                 relevance_score=0.8)
+        for c in claims
+    ]
+
+
+def _analyze(claims, plan, contradictions=None, sources=None):
+    graph = EvidenceGraph()
+    evidence = _evidence_for(claims)
+    graph.build(claims, evidence)
+    return ReasoningEngine().analyze(
+        plan=plan,
+        claims=claims,
+        graph=graph,
+        contradictions=contradictions or [],
+        sources=sources or _sources(3),
+        evidence=evidence,
+    )
+
+
+class FindingTests(unittest.TestCase):
+    def test_findings_reference_claims_and_carry_explained_confidence(self):
+        plan = _plan()
+        claims = [
+            _claim("claim-1", "Batteries store solar energy.", ["sq-1"],
+                   sources=2, agreement=0.5),
+            _claim("claim-2", "Pumped hydro also stores energy.", ["sq-2"],
+                   sources=2, agreement=0.5),
+        ]
+        result = _analyze(claims, plan)
+        self.assertEqual(len(result.findings), 2)
+        finding = result.findings[0]
+        self.assertEqual(finding.subquestion_id, "sq-1")
+        self.assertEqual(finding.claim_ids, ["claim-1"])
+        self.assertGreater(finding.confidence, 0.0)
+        self.assertIn("Confidence", finding.confidence_explanation)
+        # Every claim was stamped with explained confidence too.
+        for claim in claims:
+            self.assertGreater(claim.confidence, 0.0)
+            self.assertIn("Confidence", claim.confidence_explanation)
+
+    def test_subquestion_without_evidence_becomes_missing_evidence(self):
+        plan = _plan(subquestions=2)
+        claims = [
+            _claim("claim-1", "Batteries store solar energy.", ["sq-1"], sources=2)
+        ]
+        result = _analyze(claims, plan)
         self.assertEqual(len(result.findings), 1)
-        self.assertTrue(result.findings[0].supporting_evidence_ids)
-
-    def test_confidence_stays_below_certainty(self):
-        # Confidence is computed by the deterministic ConfidenceModel; with no
-        # authority/relevance/verification context it stays modest, and it is
-        # always capped below full certainty. Exact-value behaviour of the model
-        # is covered in test_confidence.py.
-        result = self._analyze(docs_per_query=3)
-        self.assertGreater(result.findings[0].confidence, 0.0)
-        self.assertLessEqual(result.findings[0].confidence, 0.95)
-        self.assertLess(result.overall_confidence, 1.0)
-
-    def test_generates_hypotheses_from_relationships(self):
-        result = self._analyze()
-        self.assertTrue(result.hypotheses)
-        self.assertIn("Alpha", result.hypotheses[0].statement)
-
-    def test_open_questions_and_suggestions_present(self):
-        result = self._analyze()
-        self.assertTrue(result.open_questions)
-        self.assertTrue(result.suggestions)
-
-    def test_deterministic_summary_without_llm(self):
-        result = self._analyze()
-        self.assertIn("X", result.executive_summary)
-
-    def test_llm_hypotheses_used_when_available(self):
-        llm = _ScriptedLLM({
-            "hypotheses": '["Alpha may causally drive Beta under condition C."]',
-            "synthesize grounded research findings": "Alpha and Beta are linked.",
-        })
-        result = ReasoningEngine(llm=llm).analyze(
-            topic="X",
-            tasks=self.tasks,
-            evidence=self.evidence,
-            knowledge_graph=self.graph,
-            contradictions=[],
-            documents_per_query=3,
-        )
-        self.assertTrue(any("causally drive" in h.statement for h in result.hypotheses))
-
-    def test_llm_hypotheses_fall_back_to_deterministic(self):
-        # LLM returns unusable hypothesis output -> deterministic hypotheses.
-        llm = _ScriptedLLM({"hypotheses": "not json"})
-        result = ReasoningEngine(llm=llm).analyze(
-            topic="X",
-            tasks=self.tasks,
-            evidence=self.evidence,
-            knowledge_graph=self.graph,
-            contradictions=[],
-            documents_per_query=3,
-        )
-        self.assertTrue(result.hypotheses)
-        self.assertIn("meaningful relationship", result.hypotheses[0].statement)
-
-    def test_low_source_diversity_flags_open_question(self):
-        # Only one source -> distinct_sources < 2 for the collect task.
-        self.evidence = [
-            Evidence(id="ev-1", claim="X is real.", source_id="src-1",
-                     task_id="collect-1", entities=["Alpha"]),
-        ]
-        self.graph = KnowledgeGraph()
-        self.graph.build(self.evidence)
-        result = self._analyze()
+        self.assertEqual(result.weak_subquestion_ids, ["sq-2"])
         self.assertTrue(
-            any("corroborate" in q for q in result.open_questions)
+            any("Subquestion 2?" in gap for gap in result.missing_evidence)
         )
+
+    def test_single_source_subquestion_is_weak_but_still_reported(self):
+        plan = _plan(subquestions=1)
+        claims = [_claim("claim-1", "Solo claim.", ["sq-1"], sources=1)]
+        result = _analyze(claims, plan)
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(result.weak_subquestion_ids, ["sq-1"])
+        self.assertTrue(
+            any("single-source" in gap for gap in result.missing_evidence)
+        )
+
+
+class DirectAnswerTests(unittest.TestCase):
+    def test_question_plan_gets_direct_answer_from_strongest_claims(self):
+        plan = _plan(is_question=True)
+        claims = [
+            _claim("claim-1", "Batteries store solar energy overnight.", ["sq-1"],
+                   sources=3, agreement=0.8),
+            _claim("claim-2", "Storage lags demand.", ["sq-2"], sources=1),
+        ]
+        result = _analyze(claims, plan)
+        self.assertIn("Batteries store solar energy overnight.", result.direct_answer)
+
+    def test_topic_plan_gets_no_direct_answer(self):
+        plan = _plan(is_question=False)
+        claims = [_claim("claim-1", "X.", ["sq-1"], sources=2)]
+        result = _analyze(claims, plan)
+        self.assertEqual(result.direct_answer, "")
+
+    def test_no_usable_claims_yields_empty_answer(self):
+        plan = _plan(is_question=True, subquestions=1)
+        result = _analyze([], plan)
+        self.assertEqual(result.direct_answer, "")
+        self.assertEqual(result.findings, [])
+        self.assertEqual(result.confidence.score, 0.0)
+
+
+class DerivationTests(unittest.TestCase):
+    def test_patterns_flag_entities_spanning_subquestions(self):
+        plan = _plan(subquestions=2)
+        claims = [
+            _claim("claim-1", "A.", ["sq-1"], sources=2),
+            _claim("claim-2", "B.", ["sq-2"], sources=2),
+        ]
+        claims[0].entities = ["Battery"]
+        claims[1].entities = ["Battery"]
+        result = _analyze(claims, plan)
+        self.assertTrue(any("Battery" in p for p in result.patterns))
+
+    def test_open_questions_from_claims_and_contradictions(self):
+        plan = _plan(subquestions=1)
+        claims = [
+            _claim("claim-1", "What is the long-term degradation rate?",
+                   ["sq-1"], claim_type=ClaimType.OPEN_QUESTION),
+            _claim("claim-2", "Batteries degrade.", ["sq-1"], sources=2),
+        ]
+        contradiction = Contradiction(
+            id="contra-1", description="X vs Y", claim_ids=["claim-2"]
+        )
+        result = _analyze(claims, plan, contradictions=[contradiction])
+        self.assertIn(
+            "What is the long-term degradation rate?", result.open_questions
+        )
+        self.assertTrue(any("X vs Y" in q for q in result.open_questions))
+
+    def test_open_question_claims_do_not_become_findings(self):
+        plan = _plan(subquestions=1)
+        claims = [
+            _claim("claim-1", "What remains unknown?", ["sq-1"],
+                   claim_type=ClaimType.OPEN_QUESTION),
+        ]
+        result = _analyze(claims, plan)
+        self.assertEqual(result.findings, [])
+
+    def test_hypotheses_from_entity_cooccurrence(self):
+        plan = _plan(subquestions=1)
+        claims = [
+            _claim("claim-1", "Batteries and inverters work together.", ["sq-1"],
+                   sources=2),
+        ]
+        claims[0].entities = ["Battery", "Inverter"]
+        result = _analyze(claims, plan)
+        self.assertTrue(result.hypotheses)
+        self.assertIn("Battery", result.hypotheses[0].statement)
+        self.assertEqual(result.hypotheses[0].claim_ids, ["claim-1"])
+
+    def test_overall_confidence_reflects_coverage(self):
+        # Same claims; a plan with an unanswered subquestion scores lower.
+        claims1 = [_claim("claim-1", "X.", ["sq-1"], sources=2, agreement=0.5)]
+        claims2 = [_claim("claim-1", "X.", ["sq-1"], sources=2, agreement=0.5)]
+        full = _analyze(claims1, _plan(subquestions=1))
+        partial = _analyze(claims2, _plan(subquestions=2))
+        self.assertGreater(full.confidence.score, partial.confidence.score)
+        self.assertEqual(full.confidence.coverage, 1.0)
+        self.assertEqual(partial.confidence.coverage, 0.5)
+
+    def test_executive_summary_mentions_question(self):
+        plan = _plan(subquestions=1)
+        claims = [_claim("claim-1", "X works.", ["sq-1"], sources=2)]
+        result = _analyze(claims, plan)
+        self.assertIn(plan.question, result.executive_summary)
 
 
 if __name__ == "__main__":

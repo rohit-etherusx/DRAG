@@ -1,113 +1,81 @@
 """Evidence processing.
 
-Converts raw documents into normalized :class:`Evidence` items: it splits
-content into claims, de-duplicates them, extracts candidate entities, records
-provenance, and flags conflicting claims. Every evidence item remains traceable
-to its originating source and task.
+Converts downloaded documents into the claim pipeline's inputs, in two stages:
+
+1. **Passage extraction** (``OBJECTIVE.md`` module 4): each document is split
+   into passages, scored against the subquestion it was retrieved for, and only
+   the high-scoring passages become :class:`Evidence` items. Documents are
+   never passed whole to an LLM. Deterministic.
+2. **Claim extraction** (module 5): a :class:`ClaimExtractor` (LLM-backed when
+   configured, heuristic otherwise) turns each document's evidence passages
+   into typed :class:`ExtractedClaim`s.
+
+The processor owns the strategy-independent concerns — id assignment, global
+passage de-duplication, and provenance — so every evidence item remains
+traceable to its document and source regardless of how claims were extracted.
 """
 from __future__ import annotations
 
-from research_engine.domain.models import Contradiction, Evidence, RawDocument
-from research_engine.processing.extraction import ClaimExtractor, HeuristicClaimExtractor
+from research_engine.domain.models import Evidence, RawDocument
+from research_engine.processing.extraction import ClaimExtractor, ExtractedClaim
+from research_engine.ranking.passages import PassageSelector
 from research_engine.utils import normalize_claim
-
-_NEGATIONS = {"not", "no", "never", "cannot", "without", "lacks", "fails"}
 
 
 class EvidenceProcessor:
-    """Extracts and normalizes evidence from raw documents.
-
-    Claim extraction is delegated to a :class:`ClaimExtractor` (heuristic by
-    default, LLM-backed when configured). The processor owns the concerns that
-    are strategy-independent: global de-duplication, id assignment, and
-    provenance. This keeps every evidence item traceable to its source and task
-    regardless of how claims were extracted.
-    """
+    """Extracts evidence passages and typed claims from downloaded documents."""
 
     def __init__(
         self,
-        topic_keywords: list[str] | None = None,
-        extractor: ClaimExtractor | None = None,
+        extractor: ClaimExtractor,
+        selector: PassageSelector | None = None,
     ) -> None:
-        self._extractor = extractor or HeuristicClaimExtractor(topic_keywords)
+        self._extractor = extractor
+        self._selector = selector or PassageSelector()
         self._counter = 0
-        self._seen: set[str] = set()
-        #: LLM-extracted relationships with provenance, accumulated across all
-        #: ``process`` calls: (source, relation, target, evidence_ids).
-        self._relationships: list[tuple[str, str, str, list[str]]] = []
+        self._seen_passages: set[str] = set()
 
-    @property
-    def relationships(self) -> list[tuple[str, str, str, list[str]]]:
-        """Relationships extracted so far, tagged with supporting evidence ids."""
-        return self._relationships
+    def process(
+        self, documents: list[RawDocument], subquestion_text: str
+    ) -> tuple[list[Evidence], list[ExtractedClaim]]:
+        """Return (evidence passages, extracted claims) for ``documents``.
 
-    def process(self, documents: list[RawDocument]) -> list[Evidence]:
-        """Return de-duplicated evidence extracted from ``documents``.
-
-        De-duplication is global across every document processed by this
-        instance: a claim already seen (case/whitespace-insensitive) is skipped
-        so repeated statements don't inflate confidence. Any relationships the
-        extractor reports are accumulated (with provenance) on :attr:`relationships`.
+        Passage de-duplication is global across every document processed by
+        this instance: a passage already seen (case/whitespace-insensitive) is
+        skipped so repeated text doesn't inflate corroboration downstream.
         """
-        evidence: list[Evidence] = []
+        all_evidence: list[Evidence] = []
+        all_claims: list[ExtractedClaim] = []
         for document in documents:
-            result = self._extractor.extract(document)
-            doc_evidence_ids: list[str] = []
-            for claim in result.claims:
-                key = normalize_claim(claim.text)
-                if not key or key in self._seen:
-                    continue
-                self._seen.add(key)
-                self._counter += 1
-                item = Evidence(
+            evidence = self._extract_evidence(document, subquestion_text)
+            if not evidence:
+                continue
+            all_evidence.extend(evidence)
+            all_claims.extend(self._extractor.extract(document, evidence))
+        return all_evidence, all_claims
+
+    def _extract_evidence(
+        self, document: RawDocument, subquestion_text: str
+    ) -> list[Evidence]:
+        evidence: list[Evidence] = []
+        passages = self._selector.top_passages(
+            document.content, subquestion_text, document.query
+        )
+        for passage, score in passages:
+            key = normalize_claim(passage)
+            if not key or key in self._seen_passages:
+                continue
+            self._seen_passages.add(key)
+            self._counter += 1
+            evidence.append(
+                Evidence(
                     id=f"ev-{self._counter}",
-                    claim=claim.text,
+                    passage=passage,
+                    document_id=document.id,
                     source_id=document.source.id,
                     task_id=document.task_id,
-                    entities=claim.entities,
-                    relevance_score=document.relevance_score,
+                    subquestion_id=document.subquestion_id,
+                    relevance_score=score,
                 )
-                evidence.append(item)
-                doc_evidence_ids.append(item.id)
-            for rel in result.relationships:
-                self._relationships.append(
-                    (rel.source, rel.relation, rel.target, list(doc_evidence_ids))
-                )
+            )
         return evidence
-
-    def detect_contradictions(self, evidence: list[Evidence]) -> list[Contradiction]:
-        """Flag pairs of claims that appear to conflict.
-
-        Heuristic: two claims share substantial vocabulary but differ on the
-        presence of a negation word. This is deliberately simple for v0.1 and is
-        isolated here so it can be strengthened without touching callers.
-        """
-        contradictions: list[Contradiction] = []
-        counter = 0
-        for i in range(len(evidence)):
-            words_i = _content_words(evidence[i].claim)
-            neg_i = bool(words_i & _NEGATIONS)
-            for j in range(i + 1, len(evidence)):
-                words_j = _content_words(evidence[j].claim)
-                neg_j = bool(words_j & _NEGATIONS)
-                if neg_i == neg_j:
-                    continue
-                shared = (words_i - _NEGATIONS) & (words_j - _NEGATIONS)
-                smaller = min(len(words_i - _NEGATIONS), len(words_j - _NEGATIONS)) or 1
-                if len(shared) / smaller >= 0.6 and len(shared) >= 3:
-                    counter += 1
-                    contradictions.append(
-                        Contradiction(
-                            id=f"contra-{counter}",
-                            description=(
-                                "Potentially conflicting claims: "
-                                f'"{evidence[i].claim}" vs "{evidence[j].claim}"'
-                            ),
-                            evidence_ids=[evidence[i].id, evidence[j].id],
-                        )
-                    )
-        return contradictions
-
-
-def _content_words(claim: str) -> set[str]:
-    return {w.lower() for w in claim.replace(".", " ").split() if len(w) >= 3}

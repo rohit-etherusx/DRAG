@@ -1,6 +1,7 @@
 """Small, dependency-free helpers shared across subsystems."""
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 
@@ -109,6 +110,62 @@ def keywords(text: str, limit: int = 8) -> list[str]:
         if len(out) >= limit:
             break
     return out
+
+
+def parse_json_object(raw: str | None) -> dict | None:
+    """Best-effort parse of an LLM response into a JSON object.
+
+    Strips a Markdown code fence if present, then falls back to the span from
+    the first ``{`` to the last ``}``. Returns ``None`` when no object can be
+    parsed — callers use that to fall back to a deterministic path.
+    """
+    payload = _json_span(raw, "{", "}")
+    if payload is None:
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def parse_json_array(raw: str | None) -> list | None:
+    """Best-effort parse of an LLM response into a JSON array (or ``None``)."""
+    payload = _json_span(raw, "[", "]")
+    if payload is None:
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, list) else None
+
+
+def string_list(value, limit: int | None = None) -> list[str]:
+    """Coerce an arbitrary JSON value into a list of non-empty strings."""
+    if not isinstance(value, list):
+        return []
+    items = [str(v).strip() for v in value if str(v).strip()]
+    return items[:limit] if limit is not None else items
+
+
+def _json_span(raw: str | None, open_ch: str, close_ch: str) -> str | None:
+    if not raw:
+        return None
+    text = raw.strip()
+    if "```" in text:
+        # Prefer the contents of the first fenced code block.
+        fence = text.split("```", 2)
+        if len(fence) >= 2:
+            block = fence[1]
+            if block.lower().startswith("json"):
+                block = block[4:]
+            text = block.strip() or text
+    start = text.find(open_ch)
+    end = text.rfind(close_ch)
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start : end + 1]
 
 
 _STOPWORDS = {

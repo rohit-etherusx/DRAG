@@ -40,17 +40,27 @@ class PassageSelector:
         Passages are kept in their original order (so the reduced text still
         reads coherently). Falls open to the full content when nothing qualifies.
         """
+        kept = self.top_passages(content, topic, query)
+        return "\n\n".join(passage for passage, _score in kept)
+
+    def top_passages(
+        self, content: str, topic: str, query: str = ""
+    ) -> list[tuple[str, float]]:
+        """Return the most relevant ``(passage, score)`` pairs in ``content``.
+
+        Passages are returned in their original document order. Fails open: when
+        nothing qualifies (very short documents, unusual layout, or no terms to
+        rank on) the full content is returned as a single passage rather than
+        risk dropping a genuinely useful document to zero evidence.
+        """
         content = content.strip()
         if not content:
-            return content
+            return []
 
         terms = self._terms(topic, query)
-        if not terms:
-            return content  # nothing to rank on — keep everything
-
         passages = self._split(content)
-        if len(passages) <= 1:
-            return content  # not worth splitting
+        if not terms or len(passages) <= 1:
+            return [(content, _passage_score(content, terms) if terms else 1.0)]
 
         scored = [
             (index, passage, _passage_score(passage, terms))
@@ -58,12 +68,12 @@ class PassageSelector:
         ]
         qualifying = [s for s in scored if s[2] >= self._min_relevance]
         if not qualifying:
-            return content  # fail open
+            return [(content, _passage_score(content, terms))]  # fail open
 
         # Take the best N, then restore original order for readability.
         qualifying.sort(key=lambda s: s[2], reverse=True)
         kept = sorted(qualifying[: self._max_passages], key=lambda s: s[0])
-        return "\n\n".join(passage for _, passage, _ in kept)
+        return [(passage, round(score, 4)) for _, passage, score in kept]
 
     def _terms(self, topic: str, query: str) -> set[str]:
         terms = {k.lower() for k in keywords(topic)}

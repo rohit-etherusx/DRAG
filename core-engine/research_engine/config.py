@@ -103,23 +103,28 @@ class EngineConfig:
     #: Output-token ceiling for LLM synthesis calls.
     llm_max_tokens: int = 1500
 
-    # --- v0.3: evidence quality / ranking / verification -----------------
-    #: Master switch for the ranking gate (document ranking, authority scoring,
-    #: relevance filtering, passage selection). When off, all retrieved documents
-    #: are processed (v0.2 behaviour) — useful for A/B comparison.
-    ranking_enabled: bool = True
-    #: Minimum 0..1 relevance a document must score to enter processing. Documents
-    #: below this are rejected before extraction (evidence-pollution / token gate).
-    relevance_threshold: float = 0.12
+    # --- v0.4: candidate evaluation / claim pipeline / research loop ------
+    #: Master switch for the candidate-evaluation gate. When off, every search
+    #: candidate is downloaded (no metadata filtering) — useful for A/B runs.
+    evaluation_enabled: bool = True
+    #: Search candidates retrieved per generated search query (metadata only).
+    max_candidates_per_query: int = 8
+    #: Minimum 0..1 relevance (scored on title/snippet/URL only) a candidate
+    #: must reach to be downloaded. Below this it is rejected before download.
+    candidate_relevance_threshold: float = 0.15
     #: Optional 0..1 authority gate. 0.0 disables authority-based rejection
     #: (authority still feeds confidence). Raise to also drop low-authority sources.
     min_authority: float = 0.0
-    #: Maximum number of passages kept per document for extraction (token budget).
+    #: Maximum number of passages kept per document for claim extraction.
     max_passages: int = 6
     #: Minimum 0..1 passage relevance to keep a passage (fail-open if none pass).
     passage_min_relevance: float = 0.05
-    #: Master switch for claim clustering + evidence verification.
+    #: Master switch for claim verification (clustering, agreement, contradictions).
     verification_enabled: bool = True
+    #: Research loop: stop iterating once overall confidence reaches this value.
+    confidence_threshold: float = 0.7
+    #: Research loop: search budget — maximum retrieval→verification iterations.
+    max_iterations: int = 2
 
     #: Logging verbosity.
     log_level: str = "INFO"
@@ -147,9 +152,14 @@ class EngineConfig:
                 ("RE_LLM_BASE_URL", "OPENROUTER_BASE_URL"), cls.llm_base_url
             ),
             llm_max_tokens=_env_int("RE_LLM_MAX_TOKENS", cls.llm_max_tokens),
-            ranking_enabled=_env_bool("RE_RANKING_ENABLED", cls.ranking_enabled),
-            relevance_threshold=_env_float(
-                "RE_RELEVANCE_THRESHOLD", cls.relevance_threshold
+            evaluation_enabled=_env_bool(
+                "RE_EVALUATION_ENABLED", cls.evaluation_enabled
+            ),
+            max_candidates_per_query=_env_int(
+                "RE_MAX_CANDIDATES_PER_QUERY", cls.max_candidates_per_query
+            ),
+            candidate_relevance_threshold=_env_float(
+                "RE_CANDIDATE_RELEVANCE_THRESHOLD", cls.candidate_relevance_threshold
             ),
             min_authority=_env_float("RE_MIN_AUTHORITY", cls.min_authority),
             max_passages=_env_int("RE_MAX_PASSAGES", cls.max_passages),
@@ -159,6 +169,10 @@ class EngineConfig:
             verification_enabled=_env_bool(
                 "RE_VERIFICATION_ENABLED", cls.verification_enabled
             ),
+            confidence_threshold=_env_float(
+                "RE_CONFIDENCE_THRESHOLD", cls.confidence_threshold
+            ),
+            max_iterations=_env_int("RE_MAX_ITERATIONS", cls.max_iterations),
             log_level=os.environ.get("RE_LOG_LEVEL", cls.log_level),
         )
         for key, value in overrides.items():

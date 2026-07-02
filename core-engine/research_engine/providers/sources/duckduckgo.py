@@ -1,11 +1,11 @@
 """DuckDuckGo web search provider.
 
 Uses DuckDuckGo's no-key "lite" endpoint (``lite.duckduckgo.com/lite/``) via an
-HTTP POST to obtain general web results, then best-effort fetches and extracts
-readable text from each result page. This adds open-web breadth beyond the
-encyclopedic/academic sources. It is the least structured source, so every step
-degrades gracefully: a failed page fetch falls back to the result snippet, and a
-failed search returns no documents.
+HTTP POST to obtain general web results. ``search_candidates`` returns only the
+result metadata (URL, title, snippet) — no page is downloaded; ``fetch``
+retrieves and extracts readable text from one accepted result page, falling
+back to the snippet when the page cannot be fetched. This is the least
+structured source, so every step degrades gracefully.
 """
 from __future__ import annotations
 
@@ -13,11 +13,11 @@ import html
 import re
 import urllib.parse
 
-from research_engine.domain.models import RawDocument
+from research_engine.domain.models import RawDocument, SearchCandidate
 from research_engine.logging_setup import get_logger
 from research_engine.providers.base import SearchProvider
 from research_engine.providers.sources import _http
-from research_engine.providers.sources._common import build_document
+from research_engine.providers.sources._common import build_candidate, build_document
 
 _log = get_logger("providers.duckduckgo")
 
@@ -37,7 +37,7 @@ _TAG_RE = re.compile(r"<[^>]+>")
 
 
 class DuckDuckGoSearchProvider(SearchProvider):
-    """Search the open web via DuckDuckGo and extract page text."""
+    """Search the open web via DuckDuckGo; fetch pages only when accepted."""
 
     name = "duckduckgo"
 
@@ -53,7 +53,7 @@ class DuckDuckGoSearchProvider(SearchProvider):
         self._fetch_pages = fetch_pages
         self._max_chars = max_chars
 
-    def search(self, query: str, limit: int) -> list[RawDocument]:
+    def search_candidates(self, query: str, limit: int) -> list[SearchCandidate]:
         limit = max(1, limit)
         try:
             page = self._post_text(_SEARCH_URL, {"q": query})
@@ -61,19 +61,16 @@ class DuckDuckGoSearchProvider(SearchProvider):
             _log.warning("DuckDuckGo search failed for %r: %s", query, exc)
             return []
 
-        results = _parse_results(page)[:limit]
-        documents: list[RawDocument] = []
-        for url, title, snippet in results:
-            content = self._page_content(url) or snippet
-            if not content:
-                continue
-            documents.append(
-                build_document(
-                    query, title or url, _http.truncate(content, self._max_chars),
-                    url, self.name,
-                )
-            )
-        return documents
+        return [
+            build_candidate(query, title or url, snippet, url, self.name)
+            for url, title, snippet in _parse_results(page)[:limit]
+        ]
+
+    def fetch(self, candidate: SearchCandidate) -> RawDocument | None:
+        content = self._page_content(candidate.url) or candidate.snippet
+        if not content:
+            return None
+        return build_document(candidate, _http.truncate(content, self._max_chars))
 
     def _page_content(self, url: str) -> str:
         if not self._fetch_pages:

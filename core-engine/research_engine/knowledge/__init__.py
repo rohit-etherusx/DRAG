@@ -1,1 +1,1 @@
-"""Knowledge graph of entities and relationships."""
+"""Evidence graph: claim-primary reasoning memory with typed edges."""

@@ -2,180 +2,195 @@ import unittest
 
 from tests import _path  # noqa: F401
 
-from research_engine.config import EngineConfig
-from research_engine.domain.models import RawDocument, Source
+from research_engine.domain.models import ResearchPlan, SearchCandidate, Source
 from research_engine.ranking.authority import (
     ENCYCLOPEDIA,
     PRIMARY,
     SourceAuthorityScorer,
 )
+from research_engine.ranking.evaluator import CandidateEvaluator
 from research_engine.ranking.passages import PassageSelector
-from research_engine.ranking.ranker import build_ranker
-from research_engine.ranking.relevance import HeuristicRelevanceScorer, _parse_score
 
 
-def _doc(content, title="t", query="quantum computing", url="", provider="test"):
-    return RawDocument(
-        id="d1",
-        query=query,
-        task_id="collect-1",
-        title=title,
-        content=content,
-        source=Source(id="src-1", title=title, provider=provider, locator=url),
-    )
-
-
-class AuthorityTests(unittest.TestCase):
+class AuthorityScorerTests(unittest.TestCase):
     def setUp(self):
         self.scorer = SourceAuthorityScorer()
 
-    def test_arxiv_domain_is_primary(self):
-        s = Source(id="s", title="t", provider="arxiv", locator="https://arxiv.org/abs/1234")
-        score, tier, domain = self.scorer.score(s)
-        self.assertEqual(tier, PRIMARY.name)
+    def _source(self, locator, provider="web"):
+        return Source(id="s", title="t", provider=provider, locator=locator)
+
+    def test_known_domains_map_to_tiers(self):
+        score, tier, domain = self.scorer.score(
+            self._source("https://arxiv.org/abs/1234")
+        )
+        self.assertEqual((score, tier), (PRIMARY.score, PRIMARY.name))
         self.assertEqual(domain, "arxiv.org")
-        self.assertAlmostEqual(score, PRIMARY.score)
 
-    def test_wikipedia_subdomain_is_encyclopedia(self):
-        s = Source(id="s", title="t", provider="wikipedia", locator="https://en.wikipedia.org/wiki/X")
-        _, tier, domain = self.scorer.score(s)
-        self.assertEqual(tier, ENCYCLOPEDIA.name)
-        self.assertEqual(domain, "en.wikipedia.org")
+        score, tier, _ = self.scorer.score(
+            self._source("https://en.wikipedia.org/wiki/X")
+        )
+        self.assertEqual((score, tier), (ENCYCLOPEDIA.score, ENCYCLOPEDIA.name))
 
-    def test_gov_and_edu_tlds(self):
-        gov = Source(id="s", title="t", provider="web", locator="https://nasa.gov/page")
-        edu = Source(id="s", title="t", provider="web", locator="https://mit.edu/page")
-        self.assertEqual(self.scorer.score(gov)[1], "official")
-        self.assertEqual(self.scorer.score(edu)[1], "educational")
+    def test_tld_heuristics(self):
+        _, tier, _ = self.scorer.score(self._source("https://www.nasa.gov/x"))
+        self.assertEqual(tier, "official")
+        _, tier, _ = self.scorer.score(self._source("https://cs.stanford.edu/x"))
+        self.assertEqual(tier, "educational")
 
-    def test_personal_blog_platform(self):
-        s = Source(id="s", title="t", provider="web", locator="https://someone.medium.com/post")
-        self.assertEqual(self.scorer.score(s)[1], "personal blog")
-
-    def test_provider_fallback_when_no_domain(self):
-        # Offline provider produces local:// locators with no network domain.
-        s = Source(id="s", title="t", provider="local-knowledge (offline heuristic)", locator="local://x/0")
-        score, tier, domain = self.scorer.score(s)
+    def test_provider_fallback_without_domain(self):
+        _, tier, domain = self.scorer.score(
+            self._source("local://query/0", provider="local-knowledge (offline heuristic)")
+        )
         self.assertEqual(domain, "")
         self.assertEqual(tier, "synthetic (offline)")
 
-    def test_scoring_does_not_mutate_source(self):
-        s = Source(id="s", title="t", provider="arxiv", locator="https://arxiv.org/abs/1")
-        self.scorer.score(s)
-        self.assertEqual(s.authority, 0.0)  # unchanged; the ranker stamps it
-
-
-class RelevanceTests(unittest.TestCase):
-    def test_relevant_document_scores_higher_than_irrelevant(self):
-        scorer = HeuristicRelevanceScorer(["quantum", "computing"])
-        relevant = _doc("Quantum computing uses qubits for quantum computation.")
-        irrelevant = _doc("The recipe calls for flour, sugar, and butter.")
-        self.assertGreater(
-            scorer.score(relevant, "quantum computing"),
-            scorer.score(irrelevant, "quantum computing"),
+    def test_score_url_scores_bare_urls(self):
+        score, tier, domain = self.scorer.score_url(
+            "https://arxiv.org/abs/1", "arxiv"
         )
-
-    def test_title_match_contributes(self):
-        scorer = HeuristicRelevanceScorer(["quantum", "computing"])
-        with_title = _doc("Some body text.", title="Quantum Computing overview")
-        without = _doc("Some body text.", title="Unrelated heading")
-        self.assertGreater(
-            scorer.score(with_title, "quantum computing"),
-            scorer.score(without, "quantum computing"),
-        )
-
-    def test_no_terms_fails_open(self):
-        scorer = HeuristicRelevanceScorer([])
-        self.assertEqual(scorer.score(_doc("anything", query=""), ""), 1.0)
-
-    def test_parse_score_extracts_and_clamps(self):
-        self.assertEqual(_parse_score("0.8"), 0.8)
-        self.assertEqual(_parse_score("Relevance: 0.35 out of 1"), 0.35)
-        self.assertEqual(_parse_score("1.0"), 1.0)
-        self.assertIsNone(_parse_score("no number here"))
-        self.assertIsNone(_parse_score(None))
+        self.assertEqual(tier, PRIMARY.name)
+        self.assertEqual(domain, "arxiv.org")
 
 
-class PassageTests(unittest.TestCase):
-    def test_keeps_relevant_passage_drops_irrelevant(self):
-        selector = PassageSelector(max_passages=1, min_relevance=0.01)
-        content = (
-            "Quantum computing relies on qubits and superposition.\n\n"
-            "Unrelated paragraph about gardening and tomatoes."
-        )
-        result = selector.select(content, "quantum computing")
-        self.assertIn("qubits", result)
-        self.assertNotIn("tomatoes", result)
-
-    def test_fails_open_when_nothing_qualifies(self):
-        selector = PassageSelector(max_passages=2, min_relevance=0.99)
-        content = "Alpha beta gamma.\n\nDelta epsilon zeta."
-        # No topic terms match => nothing qualifies => original content returned.
-        self.assertEqual(selector.select(content, "quantum computing"), content)
-
-    def test_single_passage_returned_as_is(self):
-        selector = PassageSelector()
-        self.assertEqual(selector.select("One sentence only.", "topic"), "One sentence only.")
-
-    def test_preserves_original_order(self):
-        selector = PassageSelector(max_passages=2, min_relevance=0.01)
-        content = (
-            "Quantum theory is foundational.\n\n"
-            "Filler about nothing in particular.\n\n"
-            "Quantum computing extends quantum theory."
-        )
-        result = selector.select(content, "quantum computing")
-        self.assertLess(result.index("foundational"), result.index("extends"))
+def _candidate(url, title, snippet, provider="web"):
+    return SearchCandidate(
+        id=f"cand-{url}", query="q", title=title, snippet=snippet, url=url,
+        provider=provider,
+    )
 
 
-class RankerTests(unittest.TestCase):
-    def _config(self, **overrides):
-        cfg = EngineConfig()
-        for k, v in overrides.items():
-            setattr(cfg, k, v)
-        return cfg
+def _plan(**overrides):
+    defaults = dict(
+        objective="Understand solar energy storage",
+        question="solar energy storage",
+        subject="solar energy storage",
+        expected_entities=["battery"],
+        exclusion_criteria=[],
+    )
+    defaults.update(overrides)
+    return ResearchPlan(**defaults)
 
-    def test_rejects_irrelevant_and_stamps_scores(self):
-        ranker = build_ranker(
-            self._config(relevance_threshold=0.2),
-            "quantum computing",
-            ["quantum", "computing"],
-        )
-        docs = [
-            _doc("Quantum computing uses qubits for computation.", url="https://arxiv.org/abs/1"),
-            _doc("A dessert recipe with flour and sugar.", url="https://cooking.example.com/x"),
+
+class CandidateEvaluatorTests(unittest.TestCase):
+    def test_relevant_candidates_accepted_and_scored(self):
+        evaluator = CandidateEvaluator(_plan(), max_accepted=3)
+        candidates = [
+            _candidate(
+                "https://en.wikipedia.org/wiki/Solar",
+                "Solar energy storage",
+                "Batteries store solar energy for later use.",
+            ),
+            _candidate(
+                "https://example.com/cats",
+                "Cute cats compilation",
+                "Cats doing funny things.",
+            ),
         ]
-        outcome = ranker.rank(docs)
+        outcome = evaluator.evaluate(candidates, "How is solar energy stored?")
         self.assertEqual(len(outcome.accepted), 1)
-        self.assertEqual(outcome.rejected, 1)
-        # Authority + relevance stamped on the originals (record keeping).
-        self.assertEqual(docs[0].source.authority_tier, PRIMARY.name)
-        self.assertGreater(docs[0].relevance_score, 0.0)
+        accepted = outcome.accepted[0]
+        self.assertTrue(accepted.accepted)
+        self.assertIn("wikipedia", accepted.url)
+        self.assertGreater(accepted.relevance_score, 0.15)
+        self.assertEqual(accepted.authority_tier, ENCYCLOPEDIA.name)
 
-    def test_disabled_ranker_accepts_everything(self):
-        ranker = build_ranker(
-            self._config(ranking_enabled=False),
-            "quantum computing",
-            ["quantum", "computing"],
+        rejected = outcome.rejected[0]
+        self.assertFalse(rejected.accepted)
+        self.assertIn("relevance", rejected.rejection_reason)
+
+    def test_exclusion_criteria_reject_from_metadata(self):
+        evaluator = CandidateEvaluator(
+            _plan(exclusion_criteria=["stock price"]), max_accepted=3
         )
-        docs = [_doc("totally unrelated content about nothing")]
-        outcome = ranker.rank(docs)
+        candidates = [
+            _candidate(
+                "https://finance.example.com",
+                "Solar energy stock price soars",
+                "Solar storage battery energy shares rally.",
+            )
+        ]
+        outcome = evaluator.evaluate(candidates, "solar energy storage")
+        self.assertEqual(outcome.accepted, [])
+        self.assertIn("exclusion", outcome.rejected[0].rejection_reason)
+
+    def test_duplicate_titles_are_rejected(self):
+        evaluator = CandidateEvaluator(_plan(), max_accepted=5)
+        candidates = [
+            _candidate("https://a.com/1", "Solar energy storage",
+                       "Battery storage of solar energy."),
+            _candidate("https://b.com/2", "Solar energy storage",
+                       "Battery storage of solar energy."),
+        ]
+        outcome = evaluator.evaluate(candidates, "solar energy storage")
         self.assertEqual(len(outcome.accepted), 1)
-        self.assertEqual(outcome.rejected, 0)
+        self.assertEqual(outcome.rejected[0].rejection_reason, "duplicate title")
+
+    def test_budget_keeps_most_relevant_first(self):
+        evaluator = CandidateEvaluator(_plan(), max_accepted=1)
+        weaker = _candidate("https://a.com/1", "Solar panels",
+                            "Solar energy overview.")
+        stronger = _candidate("https://b.com/2", "Solar energy storage battery",
+                              "How battery systems store solar energy.")
+        outcome = evaluator.evaluate([weaker, stronger], "solar energy storage battery")
+        self.assertEqual(len(outcome.accepted), 1)
+        self.assertEqual(outcome.accepted[0].url, "https://b.com/2")
+        self.assertIn("budget", outcome.rejected[0].rejection_reason)
+
+    def test_disabled_gate_still_scores_but_accepts_all(self):
+        evaluator = CandidateEvaluator(_plan(), enabled=False, max_accepted=5)
+        candidates = [
+            _candidate("https://example.com/cats", "Cats", "Cats being cats."),
+        ]
+        outcome = evaluator.evaluate(candidates, "solar energy storage")
+        self.assertEqual(len(outcome.accepted), 1)
+        # Scores are still stamped for the audit trail.
+        self.assertEqual(candidates[0].authority_tier, "unknown web")
 
     def test_min_authority_gate(self):
-        ranker = build_ranker(
-            self._config(relevance_threshold=0.0, min_authority=0.9),
-            "quantum computing",
-            ["quantum", "computing"],
+        evaluator = CandidateEvaluator(_plan(), min_authority=0.5, max_accepted=5)
+        low_authority = _candidate(
+            "https://medium.com/post", "Solar energy storage",
+            "Battery storage of solar energy explained.",
         )
-        docs = [
-            _doc("Quantum computing content.", url="https://arxiv.org/abs/1"),  # PRIMARY 0.95
-            _doc("Quantum computing content.", url="https://random.example.com/x"),  # unknown 0.40
-        ]
-        outcome = ranker.rank(docs)
-        self.assertEqual(len(outcome.accepted), 1)
-        self.assertEqual(outcome.accepted[0].source.locator, "https://arxiv.org/abs/1")
+        outcome = evaluator.evaluate([low_authority], "solar energy storage")
+        self.assertEqual(outcome.accepted, [])
+        self.assertIn("authority", outcome.rejected[0].rejection_reason)
+
+
+class PassageSelectorTests(unittest.TestCase):
+    def test_keeps_relevant_passages_in_order(self):
+        content = (
+            "Solar panels convert sunlight into electricity.\n\n"
+            "Unrelated paragraph about medieval cooking recipes and kitchens.\n\n"
+            "Batteries store solar electricity for later use."
+        )
+        selector = PassageSelector(max_passages=2, min_relevance=0.2)
+        passages = selector.top_passages(content, "solar electricity batteries")
+        texts = [p for p, _ in passages]
+        self.assertEqual(len(texts), 2)
+        self.assertIn("Solar panels", texts[0])
+        self.assertIn("Batteries", texts[1])
+
+    def test_fails_open_when_nothing_qualifies(self):
+        content = "One paragraph.\n\nAnother paragraph."
+        selector = PassageSelector(min_relevance=0.99)
+        passages = selector.top_passages(content, "completely unrelated terms")
+        self.assertEqual(len(passages), 1)
+        self.assertEqual(passages[0][0], content)
+
+    def test_single_passage_returned_whole(self):
+        selector = PassageSelector()
+        passages = selector.top_passages("Short text about solar.", "solar")
+        self.assertEqual(len(passages), 1)
+
+    def test_empty_content(self):
+        self.assertEqual(PassageSelector().top_passages("", "topic"), [])
+
+    def test_select_concatenates(self):
+        content = "About solar power.\n\nAbout solar batteries."
+        out = PassageSelector().select(content, "solar")
+        self.assertIn("solar power", out)
+        self.assertIn("solar batteries", out)
 
 
 if __name__ == "__main__":

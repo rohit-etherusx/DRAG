@@ -20,16 +20,26 @@ _log = get_logger("cli")
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="research-engine",
-        description="Autonomous, domain-agnostic research engine (v0.1).",
+        description="Autonomous, domain-agnostic, claim-centric research engine.",
     )
-    parser.add_argument("topic", nargs="+", help="The topic to research.")
+    parser.add_argument(
+        "topic", nargs="+", help="The topic or question to research."
+    )
     parser.add_argument(
         "--max-subtopics", type=int, default=None,
-        help="Maximum number of research angles to investigate.",
+        help="Maximum number of subquestions to investigate.",
     )
     parser.add_argument(
         "--documents-per-query", type=int, default=None,
-        help="Number of documents to gather per research angle.",
+        help="Documents downloaded per subquestion (accepted candidates).",
+    )
+    parser.add_argument(
+        "--max-iterations", type=int, default=None,
+        help="Research-loop search budget (retrieval+verification passes).",
+    )
+    parser.add_argument(
+        "--confidence-threshold", type=float, default=None,
+        help="Stop iterating once overall confidence reaches this value (0-1).",
     )
     parser.add_argument("--output-dir", default=None, help="Directory for reports.")
     parser.add_argument(
@@ -60,6 +70,8 @@ def run(argv: list[str] | None = None) -> ResearchSession:
         sessions_dir=args.sessions_dir,
         max_subtopics=args.max_subtopics,
         documents_per_query=args.documents_per_query,
+        max_iterations=args.max_iterations,
+        confidence_threshold=args.confidence_threshold,
         llm_enabled=(False if args.no_llm else None),
         search_provider=("offline" if args.offline else None),
         log_level=("DEBUG" if args.verbose else None),
@@ -86,10 +98,14 @@ def main(argv: list[str] | None = None) -> int:
 def _print_summary(session: ResearchSession) -> None:
     report_path = session.report.file_path if session.report else "(none)"
     print(f"\nResearch complete: {session.request.topic}")
-    print(f"  Status:            {session.status.value}")
-    print(f"  Findings:          {len(session.findings)}")
-    print(f"  Evidence items:    {len(session.evidence)}")
-    print(f"  Entities:          {len(session.entities)}")
-    print(f"  Hypotheses:        {len(session.hypotheses)}")
+    print(f"  Status:             {session.status.value}")
+    print(f"  Iterations:         {session.iterations}")
+    print(f"  Candidates:         {session.candidates_evaluated} evaluated, "
+          f"{session.candidates_rejected} rejected before download")
+    print(f"  Documents:          {session.documents_downloaded} downloaded")
+    print(f"  Evidence passages:  {len(session.evidence)}")
+    print(f"  Verified claims:    {len(session.claims)}")
+    print(f"  Findings:           {len(session.findings)}")
+    print(f"  Hypotheses:         {len(session.hypotheses)}")
     print(f"  Overall confidence: {session.overall_confidence:.0%}")
-    print(f"  Report:            {report_path}")
+    print(f"  Report:             {report_path}")

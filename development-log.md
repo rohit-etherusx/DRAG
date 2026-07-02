@@ -1,11 +1,117 @@
 # development-log.md
 
-Running progress log for **Research Engine v0.3 — Evidence Quality, Verification,
-and Research Reasoning** (see `OBJECTIVE.md`).
+Running progress log for the Research Engine (see `OBJECTIVE.md`).
 
 Per `OBJECTIVE.md`, this is the single running progress log. `TASKS.md` holds the
 implementation plan / task board; this file records what was actually done, why,
 and what remains. Newest entries first.
+
+---
+
+## Entry 4 — v0.4: claim-centric architecture rewrite (T53–T69)
+
+**Date:** 2026-07-02
+
+### Completed
+
+The full pipeline rewrite mandated by the updated `OBJECTIVE.md`: documents are
+now evidence containers and the **verified claim** is the reasoning unit.
+
+- **T53–T54 contracts**: new domain models (`ResearchPlan`/`SubQuestion`,
+  `SearchCandidate`, passage-level `Evidence`, typed `Claim` with verification
+  metadata, `ClaimType`/`VerificationStatus`/`EdgeRelation` enums,
+  `GraphNode`/`GraphEdge`, `ConfidenceReport`); session restructured (plan,
+  candidate audit trail, claims, graph, direct answer, missing evidence,
+  iteration/efficiency stats). New config knobs: `evaluation_enabled`,
+  `max_candidates_per_query`, `candidate_relevance_threshold`,
+  `confidence_threshold`, `max_iterations`.
+- **T55 two-phase retrieval**: `SearchProvider` split into
+  `search_candidates()` (title/snippet/URL only) + `fetch()` (one accepted
+  candidate). Wikipedia (search list → extract on fetch), DuckDuckGo (lite
+  results → page fetched only on accept), arXiv (feed cached at search; fetch
+  is free), offline (deterministic candidates + synthesized fetch — the whole
+  gate is exercised offline), composite (fan-out, URL dedupe, fetch routed to
+  the owning provider).
+- **T56 planner**: structured `ResearchPlan` via LLM strict-JSON with a
+  deterministic question-aware fallback — question detection, subject
+  extraction, answer-targeted subquestions for questions vs. facet
+  decomposition for topics (implements the thesis.md "question-driven
+  research" analysis, now in scope per the new objective). Task graph derived
+  from the plan; deterministic follow-up-query generation for the loop.
+- **T57–T58 retrieval manager + candidate evaluator**: per-subquestion
+  independent searches, global URL dedupe across iterations; metadata-only
+  gate (relevance from title/snippet term coverage, deterministic authority,
+  exclusion criteria, duplicate titles, per-subquestion budget) with recorded
+  rejection reasons. Superseded `ranking/ranker.py` + `ranking/relevance.py`
+  removed.
+- **T59–T61 claim pipeline**: `PassageSelector.top_passages` → passage-level
+  `Evidence`; typed claim extraction (deterministic `classify_claim` rule
+  chain; LLM extractor prompts over numbered passages and maps claims back to
+  evidence ids); deterministic `ClaimNormalizer` (signature merge, variants,
+  provenance union).
+- **T62 verification engine**: clusters equivalent claims (same-polarity only —
+  negations contradict, never corroborate), merges clusters into canonical
+  claims, stamps agreement/independent-domain metadata, detects and links
+  contradictions, flags unsupported single-source claims.
+- **T63 evidence graph**: claim-primary typed graph (supports / contradicts /
+  extends / depends_on / defines / references) replacing the entity graph.
+- **T64–T65 confidence + reasoning**: confidence extended with coverage and
+  claim-specificity factors, per-factor `ConfidenceReport` + generated
+  plain-language explanation at claim/finding/overall level (claim-level
+  renormalizes away the coverage weight); reasoning consumes only verified
+  claims + graph + plan — findings per answerable subquestion, **direct
+  answer** for question input, patterns, missing evidence (drives the loop),
+  hypotheses, open questions.
+- **T66 adaptive report**: sections render only when supported; unanswerable
+  questions and evidence gaps are stated explicitly; full printed provenance
+  chain (finding → claim → evidence → source) plus retrieval statistics.
+- **T67 orchestrator + research loop**: iterate retrieval → verification →
+  confidence until threshold reached, no actionable gaps remain, or
+  `max_iterations` exhausted; follow-up iterations target only weak
+  subquestions with reformulated queries. CLI/API preserved (flags additive:
+  `--max-iterations`, `--confidence-threshold`).
+- **T68–T69 quality + docs**: test suite rewritten for the new architecture —
+  **125 tests, all green, network-free** (two-phase sources, planner, candidate
+  evaluator, claim pipeline, verification, evidence graph, explained
+  confidence, reasoning, adaptive report, e2e determinism + loop budget +
+  failing-provider resilience). Docs synced: `ARCHITECTURE.md` (new pipeline,
+  as required by the objective), `README.md`, `instructions.md`,
+  `docs/DESIGN.md`, `.env.example`. Version **0.4.0**.
+
+### Architectural decisions & tradeoffs
+
+- **Two-phase `SearchProvider` is a breaking interface change** (the objective
+  explicitly prioritizes correctness over backward compatibility; CLI/API
+  surfaces are unchanged). It is the mechanism behind the "reduce irrelevant
+  downloads ≥80%" goal: rejection happens before any page fetch. Offline smoke
+  run: 48 candidates evaluated, 30 rejected pre-download, 18 fetched.
+- **Cluster-merge instead of cluster-annotate**: verification merges equivalent
+  claims into one canonical claim (ids reassigned contiguously afterwards)
+  rather than keeping duplicates with cluster labels — downstream reasoning
+  and reports stay clean, and variants preserve the original wordings.
+- **Polarity guard in clustering**: "X is effective" and "X is not effective"
+  previously token-matched as equivalent; clustering now refuses to merge
+  across negation polarity so contradictions survive to be detected (caught by
+  a test during the rewrite).
+- **LLM usage is confined to semantic tasks** (planning, claim extraction,
+  phrasing of findings/answers/hypotheses/summaries), each with retry +
+  deterministic fallback; all measurement (relevance, authority, clustering,
+  agreement, coverage, specificity, confidence) is deterministic per the
+  objective.
+- **Claim-level vs. plan-level confidence**: one documented weight set; claim
+  scores pass `coverage=None` and renormalize, avoiding a second formula.
+
+### Known limitations / future work
+
+- Corroboration ≠ ground truth: widely repeated errors corroborate each other.
+- Contradiction detection remains the negation/overlap heuristic (semantic
+  detection is a seam in `verification/verifier.py`).
+- Candidate relevance is judged from titles/snippets; a well-written page with
+  a poor title can be rejected at the gate (thresholds configurable).
+- The LLM extractors/planner still depend on the configured model's JSON
+  discipline; weak models fall back to heuristics more often.
+- Pending: a live grounded run (network + `OPENROUTER_API_KEY`) to measure the
+  download/token-reduction objectives on real sources.
 
 ---
 

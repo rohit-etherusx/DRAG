@@ -1,20 +1,22 @@
 """Claim clustering.
 
-Groups equivalent claims — the same assertion made by different sources — into
-:class:`~research_engine.domain.models.ClaimCluster` objects. Clustering is
-deterministic: two claims are considered equivalent when their content-word sets
-are sufficiently similar (Jaccard overlap above a threshold). This is
-domain-agnostic and reproducible; an LLM-based semantic clusterer could be
-substituted behind the same method signature later without changing callers.
+Groups equivalent claims — the same assertion made in different words by
+different sources — so verification can compare *claims against claims*, never
+documents. Clustering is deterministic: two claims are considered equivalent
+when their content-word sets are sufficiently similar (Jaccard overlap above a
+threshold). This is domain-agnostic and reproducible; an LLM-based semantic
+clusterer could be substituted behind the same method signature later without
+changing callers.
 
-Each cluster records how many distinct sources and distinct network domains
-assert the claim, and an ``agreement`` strength derived from that corroboration.
+Exact-duplicate wordings have already been merged by the claim normalizer;
+clustering catches the fuzzier matches (word order, minor additions) that a
+signature comparison cannot.
 """
 from __future__ import annotations
 
 import re
 
-from research_engine.domain.models import ClaimCluster, Evidence, Source
+from research_engine.domain.models import Claim
 
 _TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9'\-]+")
 _STOPWORDS = {
@@ -23,66 +25,51 @@ _STOPWORDS = {
     "that", "these", "those", "it", "its", "into", "also", "such", "which", "can",
     "may", "has", "have", "had", "not", "but", "than", "then", "there",
 }
+#: Words that flip a claim's polarity. Claims with different polarity must
+#: never be treated as equivalent — "X is effective" and "X is not effective"
+#: are a *contradiction*, not a corroboration.
+_NEGATIONS = {"not", "no", "never", "cannot", "without", "lacks", "fails"}
 
 
 class ClaimClusterer:
-    """Clusters equivalent claims across evidence items (deterministic)."""
+    """Clusters equivalent claims (deterministic token-set similarity)."""
 
     def __init__(self, similarity_threshold: float = 0.6, min_tokens: int = 3) -> None:
         self._threshold = similarity_threshold
         self._min_tokens = min_tokens
 
-    def cluster(
-        self, evidence: list[Evidence], sources: dict[str, Source]
-    ) -> list[ClaimCluster]:
-        """Group ``evidence`` into equivalent-claim clusters.
-
-        ``sources`` maps ``source_id`` → :class:`Source`, used to count
-        independent domains. Order is stable: clusters follow first-seen order.
-        """
-        # (token_set, [evidence]) accumulators, in first-seen order.
-        buckets: list[tuple[set[str], list[Evidence]]] = []
-        for item in evidence:
-            tokens = _content_tokens(item.claim)
+    def cluster(self, claims: list[Claim]) -> list[list[Claim]]:
+        """Group ``claims`` into equivalence clusters, in first-seen order."""
+        # (token_set, polarity, [claims]) accumulators, in first-seen order.
+        buckets: list[tuple[set[str], bool, list[Claim]]] = []
+        for claim in claims:
+            tokens = content_tokens(claim.text)
+            polarity = negated(claim.text)
             placed = False
-            for token_set, members in buckets:
-                if _similar(tokens, token_set, self._threshold, self._min_tokens):
-                    members.append(item)
+            for token_set, bucket_polarity, members in buckets:
+                if polarity == bucket_polarity and _similar(
+                    tokens, token_set, self._threshold, self._min_tokens
+                ):
+                    members.append(claim)
                     token_set |= tokens  # let the cluster vocabulary grow
                     placed = True
                     break
             if not placed:
-                buckets.append((set(tokens), [item]))
-
-        clusters: list[ClaimCluster] = []
-        for index, (_tokens, members) in enumerate(buckets, start=1):
-            source_ids = _distinct([m.source_id for m in members])
-            domains = _distinct(
-                d for d in (
-                    _domain_for(sid, sources) for sid in source_ids
-                ) if d
-            )
-            supporting = len(source_ids)
-            independent_domains = len(domains)
-            clusters.append(
-                ClaimCluster(
-                    id=f"cluster-{index}",
-                    canonical_claim=_canonical(members),
-                    evidence_ids=[m.id for m in members],
-                    source_ids=source_ids,
-                    supporting_sources=supporting,
-                    independent_domains=independent_domains,
-                    agreement=_agreement(supporting, independent_domains),
-                )
-            )
-        return clusters
+                buckets.append((set(tokens), polarity, [claim]))
+        return [members for _tokens, _polarity, members in buckets]
 
 
-def _content_tokens(claim: str) -> set[str]:
+def content_tokens(text: str) -> set[str]:
+    """Content words of a claim (used for similarity and contradiction checks)."""
     return {
-        t for t in _TOKEN_RE.findall(claim.lower())
+        t for t in _TOKEN_RE.findall(text.lower())
         if len(t) >= 3 and t not in _STOPWORDS
     }
+
+
+def negated(text: str) -> bool:
+    """Whether a claim contains a polarity-flipping negation word."""
+    return bool(set(_TOKEN_RE.findall(text.lower())) & _NEGATIONS)
 
 
 def _similar(a: set[str], b: set[str], threshold: float, min_tokens: int) -> bool:
@@ -93,40 +80,3 @@ def _similar(a: set[str], b: set[str], threshold: float, min_tokens: int) -> boo
         return False
     union = a | b
     return len(inter) / len(union) >= threshold
-
-
-def _canonical(members: list[Evidence]) -> str:
-    """Pick a representative claim — the longest, as a stable proxy for detail."""
-    return max(members, key=lambda e: (len(e.claim), e.id)).claim
-
-
-def _agreement(supporting_sources: int, independent_domains: int) -> float:
-    """Corroboration strength in 0..1.
-
-    Rises with the number of independent sources; a small bonus rewards diversity
-    across distinct domains (independent corroboration is stronger than repeated
-    assertion within one domain). One source → 0.0 (uncorroborated).
-    """
-    if supporting_sources <= 1:
-        base = 0.0
-    else:
-        base = min(1.0, (supporting_sources - 1) / 3.0)
-    if independent_domains >= 2:
-        base = min(1.0, base + 0.15 * (independent_domains - 1))
-    return round(base, 4)
-
-
-def _domain_for(source_id: str, sources: dict[str, Source]) -> str:
-    source = sources.get(source_id)
-    return source.domain if source else ""
-
-
-def _distinct(items) -> list[str]:
-    """Distinct values, preserving first-seen order."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in items:
-        if item and item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out

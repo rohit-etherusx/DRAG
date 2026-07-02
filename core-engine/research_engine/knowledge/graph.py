@@ -1,102 +1,191 @@
-"""Knowledge graph.
+"""Evidence graph.
 
-Builds and stores the entities and relationships discovered during research.
-Entities are derived from evidence; relationships are inferred from co-occurrence
-of entities within the same evidence item. The graph is the structured, long-term
-memory of a session.
+The engine's reasoning memory (``OBJECTIVE.md`` module 8). Unlike the entity
+graph it replaces, the **claim** is the primary node; documents, evidence
+passages, and entities are secondary nodes that give claims context and
+provenance. Edges are typed:
+
+* ``supports`` — evidence passage → the claim extracted from it;
+* ``references`` — evidence → its containing document; claim → an entity it
+  mentions;
+* ``defines`` — a definition claim → the entity it defines;
+* ``contradicts`` — claim → conflicting claim (from verification);
+* ``extends`` — a numerical/date detail claim → the definition claim it adds
+  precision to (shared entity);
+* ``depends_on`` — a method claim → an assumption claim it rests on (shared
+  entity).
+
+Construction is fully deterministic: identical claims and evidence always
+produce the identical graph.
 """
 from __future__ import annotations
 
 from itertools import combinations
 
-from research_engine.domain.models import Entity, Evidence, Relationship
+from research_engine.domain.models import (
+    Claim,
+    ClaimType,
+    Entity,
+    Evidence,
+    EdgeRelation,
+    GraphEdge,
+    GraphNode,
+)
 from research_engine.utils import slugify
 
 
-class KnowledgeGraph:
-    """An entity/relationship graph built from evidence."""
+class EvidenceGraph:
+    """A typed graph over claims, evidence, documents, and entities."""
 
     def __init__(self) -> None:
+        self._nodes: dict[str, GraphNode] = {}
+        self._edges: dict[tuple[str, str, str], GraphEdge] = {}
         self._entities: dict[str, Entity] = {}
-        self._relationships: dict[str, Relationship] = {}
+        self._claims: list[Claim] = []
 
-    def build(self, evidence: list[Evidence]) -> None:
-        """Populate the graph from a list of evidence items."""
-        for item in evidence:
-            entity_ids = [self._upsert_entity(name, item.id) for name in item.entities]
-            # Co-occurring entities within one evidence item are related.
-            for a, b in combinations(sorted(set(entity_ids)), 2):
-                self._upsert_relationship(a, b, item.id)
+    def build(self, claims: list[Claim], evidence: list[Evidence]) -> None:
+        """Populate the graph from verified claims and their evidence."""
+        self._claims = list(claims)
+        evidence_by_id = {e.id: e for e in evidence}
 
-    def add_extracted_relationships(
-        self, relationships: list[tuple[str, str, str, list[str]]]
+        for claim in claims:
+            self._add_node("claim", claim.id, claim.text)
+            self._link_provenance(claim, evidence_by_id)
+            self._link_entities(claim)
+            for other_id in claim.contradicts:
+                self._add_edge(
+                    _node_id("claim", claim.id),
+                    _node_id("claim", other_id),
+                    EdgeRelation.CONTRADICTS,
+                )
+        self._link_claim_structure()
+
+    # -- construction -------------------------------------------------------
+
+    def _link_provenance(
+        self, claim: Claim, evidence_by_id: dict[str, Evidence]
     ) -> None:
-        """Add explicit, LLM-extracted relationships to the graph.
+        """evidence --supports--> claim; evidence --references--> document."""
+        for evidence_id in claim.evidence_ids:
+            item = evidence_by_id.get(evidence_id)
+            if item is None:
+                continue
+            passage_label = item.passage[:80]
+            self._add_node("evidence", item.id, passage_label)
+            self._add_edge(
+                _node_id("evidence", item.id),
+                _node_id("claim", claim.id),
+                EdgeRelation.SUPPORTS,
+            )
+            self._add_node("document", item.document_id, item.document_id)
+            self._add_edge(
+                _node_id("evidence", item.id),
+                _node_id("document", item.document_id),
+                EdgeRelation.REFERENCES,
+            )
 
-        Each tuple is ``(source_name, relation, target_name, evidence_ids)``. The
-        endpoint entities are upserted (so relationships can reference entities not
-        otherwise co-occurring), and the specific relation label overrides the
-        generic co-occurrence ``related_to`` for that entity pair.
-        """
-        for source_name, relation, target_name, evidence_ids in relationships:
-            if not source_name or not target_name:
-                continue
-            ids = evidence_ids or [""]
-            a = b = None
-            for evidence_id in ids:
-                a = self._upsert_entity(source_name, evidence_id)
-                b = self._upsert_entity(target_name, evidence_id)
-            if a is None or b is None or a == b:
-                continue
-            for evidence_id in ids:
-                self._upsert_relationship(a, b, evidence_id, relation=relation)
+    def _link_entities(self, claim: Claim) -> None:
+        """claim --defines/references--> entity; upsert the entity itself."""
+        for index, name in enumerate(claim.entities):
+            entity_id = self._upsert_entity(name, claim.id)
+            defines = claim.claim_type is ClaimType.DEFINITION and index == 0
+            self._add_edge(
+                _node_id("claim", claim.id),
+                _node_id("entity", entity_id),
+                EdgeRelation.DEFINES if defines else EdgeRelation.REFERENCES,
+            )
+
+    def _link_claim_structure(self) -> None:
+        """Derive extends / depends_on edges between claims sharing an entity."""
+        for entity in self._entities.values():
+            members = [c for c in self._claims if c.id in entity.claim_ids]
+            for a, b in combinations(members, 2):
+                self._structural_edge(a, b)
+                self._structural_edge(b, a)
+
+    def _structural_edge(self, a: Claim, b: Claim) -> None:
+        """Add a --extends/depends_on--> b when their types imply structure."""
+        detail_types = {ClaimType.NUMERICAL, ClaimType.DATE}
+        if a.claim_type in detail_types and b.claim_type is ClaimType.DEFINITION:
+            self._add_edge(
+                _node_id("claim", a.id), _node_id("claim", b.id), EdgeRelation.EXTENDS
+            )
+        if a.claim_type is ClaimType.METHOD and b.claim_type is ClaimType.ASSUMPTION:
+            self._add_edge(
+                _node_id("claim", a.id),
+                _node_id("claim", b.id),
+                EdgeRelation.DEPENDS_ON,
+            )
+
+    def _upsert_entity(self, name: str, claim_id: str) -> str:
+        entity_id = f"ent-{slugify(name)}"
+        entity = self._entities.get(entity_id)
+        if entity is None:
+            entity = Entity(id=entity_id, name=name)
+            self._entities[entity_id] = entity
+            self._add_node("entity", entity_id, name)
+        if claim_id and claim_id not in entity.claim_ids:
+            entity.claim_ids.append(claim_id)
+        return entity_id
+
+    def _add_node(self, kind: str, ref_id: str, label: str) -> None:
+        node_id = _node_id(kind, ref_id)
+        if node_id not in self._nodes:
+            self._nodes[node_id] = GraphNode(
+                id=node_id, kind=kind, label=label, ref_id=ref_id
+            )
+
+    def _add_edge(self, source_id: str, target_id: str, relation: EdgeRelation) -> None:
+        if source_id == target_id:
+            return
+        key = (source_id, target_id, relation.value)
+        if key in self._edges:
+            return
+        self._edges[key] = GraphEdge(
+            id=f"edge-{len(self._edges) + 1}",
+            source_id=source_id,
+            target_id=target_id,
+            relation=relation,
+        )
+
+    # -- query surface (used by reasoning) -----------------------------------
+
+    @property
+    def nodes(self) -> list[GraphNode]:
+        return list(self._nodes.values())
+
+    @property
+    def edges(self) -> list[GraphEdge]:
+        return list(self._edges.values())
 
     @property
     def entities(self) -> list[Entity]:
         return list(self._entities.values())
 
     @property
-    def relationships(self) -> list[Relationship]:
-        return list(self._relationships.values())
+    def claims(self) -> list[Claim]:
+        return list(self._claims)
 
-    def neighbors(self, entity_id: str) -> list[str]:
-        """Return ids of entities directly related to ``entity_id``."""
-        out: list[str] = []
-        for rel in self._relationships.values():
-            if rel.source_entity_id == entity_id:
-                out.append(rel.target_entity_id)
-            elif rel.target_entity_id == entity_id:
-                out.append(rel.source_entity_id)
-        return out
-
-    def _upsert_entity(self, name: str, evidence_id: str) -> str:
-        entity_id = f"ent-{slugify(name)}"
-        entity = self._entities.get(entity_id)
+    def claims_for_entity(self, name: str) -> list[Claim]:
+        """All claims that mention the entity ``name``."""
+        entity = self._entities.get(f"ent-{slugify(name)}")
         if entity is None:
-            entity = Entity(id=entity_id, name=name)
-            self._entities[entity_id] = entity
-        if evidence_id and evidence_id not in entity.evidence_ids:
-            entity.evidence_ids.append(evidence_id)
-        return entity_id
+            return []
+        wanted = set(entity.claim_ids)
+        return [c for c in self._claims if c.id in wanted]
 
-    def _upsert_relationship(
-        self, a: str, b: str, evidence_id: str, relation: str = "related_to"
-    ) -> None:
-        # Identity is the unordered pair, so co-occurrence and extracted edges for
-        # the same two entities collapse to one relationship (no duplicates).
-        lo, hi = sorted((a, b))
-        rel_id = f"rel-{lo}--{hi}"
-        rel = self._relationships.get(rel_id)
-        if rel is None:
-            rel = Relationship(
-                id=rel_id, source_entity_id=a, target_entity_id=b, relation=relation
-            )
-            self._relationships[rel_id] = rel
-        elif relation != "related_to" and rel.relation == "related_to":
-            # Promote a generic co-occurrence edge to a specific extracted relation,
-            # adopting the extracted direction (source -> target).
-            rel.relation = relation
-            rel.source_entity_id = a
-            rel.target_entity_id = b
-        if evidence_id and evidence_id not in rel.evidence_ids:
-            rel.evidence_ids.append(evidence_id)
+    def central_entities(self, limit: int = 5) -> list[Entity]:
+        """Entities referenced by the most claims (research focal points)."""
+        ranked = sorted(
+            self._entities.values(),
+            key=lambda e: (len(e.claim_ids), e.name),
+            reverse=True,
+        )
+        return ranked[:limit]
+
+    def edges_by_relation(self, relation: EdgeRelation) -> list[GraphEdge]:
+        return [e for e in self._edges.values() if e.relation is relation]
+
+
+def _node_id(kind: str, ref_id: str) -> str:
+    return f"n-{kind}-{ref_id}"

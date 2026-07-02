@@ -3,33 +3,38 @@
 These are the zero-dependency defaults that let the engine run and be tested
 anywhere, reproducibly. The search provider is a *local knowledge source*
 (explicitly a valid source type in ``ARCHITECTURE.md``) that synthesizes
-structured notes from the query. It is a placeholder for real web/API providers
-and is honestly attributed as such in every report.
+structured notes from the query. It implements the same two-phase
+candidate/fetch interface as the live sources — candidates carry a title and
+snippet, and ``fetch`` synthesizes the full note — so the whole pipeline,
+including candidate evaluation, is exercised offline. It is a placeholder for
+real web/API providers and is honestly attributed as such in every report.
 """
 from __future__ import annotations
 
-from research_engine.domain.models import RawDocument, Source
+from research_engine.domain.models import RawDocument, SearchCandidate, Source
 from research_engine.providers.base import LLMProvider, SearchProvider
 from research_engine.utils import keywords, utc_now_iso
 
-# Angle templates used to give each generated document a distinct facet, so that
-# downstream processing sees varied claims and entities rather than repetition.
+# Facet templates used to give each generated document a distinct angle, so
+# that downstream processing sees varied claims and entities. Each template
+# deliberately mixes claim types (definitions, dates, numbers, limitations)
+# so the offline path exercises typed claim extraction.
 _FACETS = [
     (
         "Definition and scope",
-        "{topic} refers to a distinct area of study and practice. "
+        "{topic} is defined as a distinct area of study and practice. "
         "{Kw0} and {Kw1} are commonly identified as central to {topic}. "
         "Understanding {topic} begins with delineating its scope and core terms.",
     ),
     (
         "Historical development",
-        "The development of {topic} has proceeded through several phases. "
+        "The development of {topic} has proceeded through several phases since 1990. "
         "Early work established {Kw0}, while later contributions emphasized {Kw1}. "
         "This trajectory shapes how {topic} is understood today.",
     ),
     (
         "Key components",
-        "Analyses of {topic} frequently decompose it into interacting components. "
+        "Analyses of {topic} frequently decompose it into 3 interacting components. "
         "{Kw0} interacts with {Kw1} to produce the behavior characteristic of {topic}. "
         "These components are studied both independently and as a system.",
     ),
@@ -42,7 +47,7 @@ _FACETS = [
     (
         "Challenges and open problems",
         "Several challenges remain in the study of {topic}. "
-        "Tensions between {Kw0} and {Kw1} are not fully resolved. "
+        "A known limitation is that tensions between {Kw0} and {Kw1} are not fully resolved. "
         "These open problems motivate ongoing investigation into {topic}.",
     ),
     (
@@ -64,39 +69,62 @@ class OfflineSearchProvider(SearchProvider):
 
     name = "local-knowledge (offline heuristic)"
 
-    def search(self, query: str, limit: int) -> list[RawDocument]:
+    def search_candidates(self, query: str, limit: int) -> list[SearchCandidate]:
+        topic = _display_topic(query)
+        candidates: list[SearchCandidate] = []
+        for index in range(max(0, limit)):
+            facet_title, _template = _FACETS[index % len(_FACETS)]
+            content = self._content(query, index)
+            snippet = content.split(". ")[0] + "."
+            slug = query_slug(query)
+            candidates.append(
+                SearchCandidate(
+                    id=f"cand-{slug}-{index}",
+                    query=query,
+                    title=f"{facet_title}: {topic}",
+                    snippet=snippet,
+                    url=f"local://{slug}/{index}",
+                    provider=self.name,
+                    ref=str(index),
+                )
+            )
+        return candidates
+
+    def fetch(self, candidate: SearchCandidate) -> RawDocument | None:
+        index = int(candidate.ref or 0)
+        slug = query_slug(candidate.query)
+        source = Source(
+            id=f"src-{slug}-{index}",
+            title=candidate.title,
+            provider=self.name,
+            locator=candidate.url,
+            retrieved_at=utc_now_iso(),
+            domain=candidate.domain,
+            authority=candidate.authority,
+            authority_tier=candidate.authority_tier,
+        )
+        return RawDocument(
+            id=f"doc-{slug}-{index}",
+            query=candidate.query,
+            task_id=candidate.task_id,
+            title=candidate.title,
+            content=self._content(candidate.query, index),
+            source=source,
+            subquestion_id=candidate.subquestion_id,
+            relevance_score=candidate.relevance_score,
+        )
+
+    def _content(self, query: str, index: int) -> str:
+        """Deterministic synthetic note for ``query``'s ``index``-th facet."""
         kws = keywords(query, limit=6) or [query.strip() or "the subject"]
         kw0 = kws[0]
         kw1 = kws[1] if len(kws) > 1 else kws[0]
-        topic = _display_topic(query)
-
-        docs: list[RawDocument] = []
-        for index in range(max(0, limit)):
-            facet_title, template = _FACETS[index % len(_FACETS)]
-            content = template.format(
-                topic=topic,
-                Kw0=_titlecase(kw0),
-                Kw1=_titlecase(kw1),
-            )
-            doc_id = f"{query_slug(query)}-{index}"
-            source = Source(
-                id=f"src-{doc_id}",
-                title=f"{facet_title}: {topic}",
-                provider=self.name,
-                locator=f"local://{query_slug(query)}/{index}",
-                retrieved_at=utc_now_iso(),
-            )
-            docs.append(
-                RawDocument(
-                    id=f"doc-{doc_id}",
-                    query=query,
-                    task_id="",  # assigned by the collector
-                    title=source.title,
-                    content=content,
-                    source=source,
-                )
-            )
-        return docs
+        _title, template = _FACETS[index % len(_FACETS)]
+        return template.format(
+            topic=_display_topic(query),
+            Kw0=_titlecase(kw0),
+            Kw1=_titlecase(kw1),
+        )
 
 
 class NullLLMProvider(LLMProvider):
@@ -121,8 +149,8 @@ def _titlecase(word: str) -> str:
 
 
 def _display_topic(query: str) -> str:
-    # Strip a leading facet phrase like "Overview and definition of " or
-    # "Current state and developments in " to recover the underlying topic by
+    # Strip a leading facet phrase like "What is the definition of " or
+    # "Current state and developments in " to recover the underlying subject by
     # taking the text after the last angle marker.
     best_idx = -1
     best_end = 0
@@ -132,10 +160,10 @@ def _display_topic(query: str) -> str:
             best_idx = idx
             best_end = idx + len(marker)
     if best_idx != -1:
-        candidate = query[best_end:].strip()
+        candidate = query[best_end:].strip().rstrip("?")
         if candidate:
             return candidate
-    return query.strip()
+    return query.strip().rstrip("?") or "the subject"
 
 
 def query_slug(query: str) -> str:

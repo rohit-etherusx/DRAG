@@ -1,1 +1,1 @@
-"""Transforms a research objective into an executable task graph."""
+"""Understands the research question and produces a structured research plan."""

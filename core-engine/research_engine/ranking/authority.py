@@ -126,8 +126,13 @@ class SourceAuthorityScorer:
         """Return ``(authority_score, tier_name, domain)`` for ``source``.
 
         Pure: does not mutate ``source``. The caller stamps the fields (the
-        ranker does this) so scoring stays side-effect-free and testable.
+        candidate evaluator does this) so scoring stays side-effect-free and
+        testable.
         """
         domain = source.domain or domain_of(source.locator)
         tier = self.tier_for(source)
         return tier.score, tier.name, domain
+
+    def score_url(self, url: str, provider: str) -> tuple[float, str, str]:
+        """Score a bare URL + provider name (pre-download, no Source yet)."""
+        return self.score(Source(id="", title="", provider=provider, locator=url))
