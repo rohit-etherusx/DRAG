@@ -4,7 +4,10 @@ Verification compares claims — never documents (``OBJECTIVE.md`` module 7).
 Given the normalized claims and the sources behind them, the engine:
 
 * clusters equivalent claims across sources and merges each cluster into one
-  canonical claim (evidence, sources, entities, and wordings unioned);
+  canonical claim (evidence, sources, entities, and wordings unioned) — the
+  deterministic clusterer auto-merges near-identical wordings, and an optional
+  semantic equivalence judge reviews the borderline band the clusterer cannot
+  decide lexically (``verification/equivalence.py``);
 * measures **agreement**: how many distinct sources — and, more importantly,
   distinct network domains — independently assert each claim;
 * detects **disagreement**: pairs of claims that share vocabulary but differ on
@@ -14,7 +17,8 @@ Given the normalized claims and the sources behind them, the engine:
 Every claim leaves this stage with verification metadata stamped on it
 (``supporting_sources``, ``independent_domains``, ``agreement``,
 ``contradicts``, ``status``), so downstream reasoning never needs to look
-behind the claims. Fully deterministic, keeping confidence reproducible.
+behind the claims. Without a judge the stage is fully deterministic; with one,
+the judge can only *add* merges the deterministic path missed.
 """
 from __future__ import annotations
 
@@ -27,11 +31,15 @@ from research_engine.domain.models import (
     Source,
     VerificationStatus,
 )
+from research_engine.logging_setup import get_logger
 from research_engine.verification.clustering import (
     ClaimClusterer,
     content_tokens,
     negated,
 )
+from research_engine.verification.equivalence import ClaimEquivalenceJudge
+
+_log = get_logger("verification.verifier")
 
 
 @dataclass
@@ -57,13 +65,22 @@ class VerificationResult:
 class ClaimVerifier:
     """Produces verified canonical claims from normalized claims."""
 
-    def __init__(self, clusterer: ClaimClusterer | None = None) -> None:
+    def __init__(
+        self,
+        clusterer: ClaimClusterer | None = None,
+        judge: ClaimEquivalenceJudge | None = None,
+        max_equivalence_checks: int = 40,
+    ) -> None:
         self._clusterer = clusterer or ClaimClusterer()
+        self._judge = judge
+        self._max_checks = max(0, max_equivalence_checks)
 
     def verify(
         self, claims: list[Claim], sources: dict[str, Source]
     ) -> VerificationResult:
         clusters = self._clusterer.cluster(claims)
+        if self._judge is not None and self._max_checks:
+            clusters = self._judged_merge(clusters)
         verified = [_merge_cluster(members) for members in clusters]
         for index, claim in enumerate(verified, start=1):
             claim.id = f"claim-{index}"
@@ -73,6 +90,53 @@ class ClaimVerifier:
         for claim in verified:
             claim.status = _status(claim)
         return VerificationResult(claims=verified, contradictions=contradictions)
+
+    def _judged_merge(
+        self, clusters: list[list[Claim]]
+    ) -> list[list[Claim]]:
+        """Merge clusters whose borderline pairs the equivalence judge accepts.
+
+        The judge only sees pairs the deterministic clusterer found borderline
+        (guards already applied); accepted verdicts are combined with
+        union-find so transitive equivalences collapse into one cluster while
+        first-seen ordering is preserved.
+        """
+        pairs = self._clusterer.borderline_pairs(clusters, self._max_checks)
+        if not pairs:
+            return clusters
+        seed_pairs = [(clusters[i][0], clusters[j][0]) for i, j in pairs]
+        verdicts = self._judge.equivalent(seed_pairs)
+        accepted = [pair for pair, verdict in zip(pairs, verdicts) if verdict]
+        if not accepted:
+            return clusters
+        _log.info(
+            "Equivalence judge merged %d of %d borderline claim pair(s)",
+            len(accepted),
+            len(pairs),
+        )
+
+        parent = list(range(len(clusters)))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i, j in accepted:
+            root_i, root_j = find(i), find(j)
+            if root_i != root_j:  # attach the later cluster to the earlier one
+                parent[max(root_i, root_j)] = min(root_i, root_j)
+
+        merged: dict[int, list[Claim]] = {}
+        order: list[int] = []
+        for index, members in enumerate(clusters):
+            root = find(index)
+            if root not in merged:
+                merged[root] = []
+                order.append(root)
+            merged[root].extend(members)
+        return [merged[root] for root in order]
 
     @staticmethod
     def _stamp_agreement(claim: Claim, sources: dict[str, Source]) -> None:

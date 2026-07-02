@@ -4,24 +4,33 @@ These dataclasses are the *only* contract between subsystems. No subsystem
 imports another subsystem's implementation; they exchange these types. Keeping
 the models in one module makes the data flow explicit and the boundaries stable.
 
-The claim-centric flow of a session (v0.4), expressed in these types::
+The knowledge-first agent loop of a session (v0.5), expressed in these types::
 
     ResearchRequest
         -> ResearchPlan + Task[]        (planner)
-        -> SearchCandidate[]            (targeted retrieval, metadata only)
+        -> SearchTask[]                 (adaptive planning, every iteration)
+        -> SearchCandidate[]            (retrieval, metadata only)
         -> SearchCandidate[] (accepted) (candidate evaluation)
-        -> RawDocument[]                (download, accepted candidates only)
+        -> RawDocument[]                (download; stamped with gain scores)
         -> Evidence[]                   (passage extraction)
         -> Claim[]                      (claim extraction + normalization)
-        -> Claim[] (verified)           (claim verification)
-        -> GraphNode[]/GraphEdge[]      (evidence graph)
+        -> Claim[] (verified, importance-ranked)   (verification + reasoning)
+        -> GraphNode[]/GraphEdge[]      (knowledge model)
+        -> KnowledgeGap[]               (curiosity — drives the next iteration)
+        -> IterationRecord[]            (information gain per iteration)
         -> Finding[] + Hypothesis[] + Contradiction[] + ConfidenceReport
-                                        (reasoning over verified claims)
-        -> ResearchReport               (adaptive report)
+                                        (reasoning over the knowledge model)
+        -> Answer                       (answer generation from knowledge)
+        -> ResearchReport               (rendering of the knowledge model)
 
 Documents are evidence containers; the primary reasoning unit is the verified
-claim. The provenance chain is explicit and always preserved:
-finding -> claim -> evidence -> document -> source.
+claim; the knowledge model (claims + graph) is the product of research and the
+report is a rendering of it. The provenance chain is explicit and always
+preserved: answer/finding -> claim -> evidence -> document -> source.
+
+``KnowledgeGap`` and ``SearchTask`` live here deliberately: the curiosity
+engine (reasoning layer) *produces* gaps and the planner *consumes* them, so
+routing them through the shared domain keeps module dependencies one-way.
 """
 from __future__ import annotations
 
@@ -69,6 +78,23 @@ class VerificationStatus(str, Enum):
     SINGLE_SOURCE = "single_source"
     #: At least one other claim conflicts with this one.
     CONTRADICTED = "contradicted"
+
+
+class GapKind(str, Enum):
+    """What kind of missing knowledge a :class:`KnowledgeGap` describes."""
+
+    #: A subquestion with no verified evidence at all.
+    MISSING_EVIDENCE = "missing_evidence"
+    #: A subquestion whose evidence is single-source only.
+    UNCORROBORATED = "uncorroborated"
+    #: A central entity that no definition claim covers.
+    MISSING_DEFINITION = "missing_definition"
+    #: A central entity with no relationship to the rest of the knowledge model.
+    MISSING_RELATIONSHIP = "missing_relationship"
+    #: Conflicting claims that need investigation to resolve.
+    CONTRADICTION = "contradiction"
+    #: Important claims supported only by low-authority sources.
+    MISSING_PRIMARY_SOURCE = "missing_primary_source"
 
 
 def confidence_label(score: float) -> str:
@@ -152,6 +178,107 @@ class Task:
 
 
 @dataclass
+class KnowledgeGap:
+    """A specific piece of missing knowledge, discovered by the curiosity engine.
+
+    Gaps are the fuel of the research loop: each open gap can be converted by
+    the adaptive planner into a targeted :class:`SearchTask`. Gaps persist in
+    the session so the report can state what was investigated and what remains
+    unknown.
+    """
+
+    id: str
+    kind: GapKind
+    #: Human-readable statement of what is missing and why it matters.
+    description: str
+    #: A search query expected to close the gap.
+    suggested_query: str = ""
+    #: Subquestion the gap belongs to ("" for cross-cutting gaps).
+    subquestion_id: str = ""
+    #: Entity the gap concerns ("" when not entity-specific).
+    entity: str = ""
+    #: 0..1 — how much closing this gap would advance the objective.
+    priority: float = 0.5
+    #: Whether the planner has already turned this gap into a search task.
+    investigated: bool = False
+
+
+@dataclass
+class SearchTask:
+    """One prioritized retrieval action emitted by the adaptive planner.
+
+    Unlike a bare query string, a search task records *why* it exists — the
+    knowledge it is expected to produce — so every retrieval performed by the
+    agent is explainable and auditable.
+    """
+
+    id: str
+    query: str
+    #: What knowledge this search is meant to produce.
+    objective: str
+    #: Why the planner created it (initial plan / which gap it targets).
+    reason: str
+    #: The kind of information expected (e.g. "definition", "corroboration").
+    expected_information: str = ""
+    #: 0..1 execution priority within an iteration.
+    priority: float = 0.5
+    subquestion_id: str = ""
+    #: Gap that produced this task ("" for initial-plan tasks).
+    gap_id: str = ""
+    #: Research-loop iteration the task was created for.
+    iteration: int = 1
+
+
+@dataclass
+class IterationRecord:
+    """What one research-loop iteration contributed to the knowledge model.
+
+    The information-gain analyzer fills these in; the stopping engine reads
+    them to detect when further searching has stopped teaching the engine
+    anything new.
+    """
+
+    iteration: int
+    search_tasks: int = 0
+    documents_downloaded: int = 0
+    #: Claims that existed before / after this iteration's knowledge update.
+    claims_before: int = 0
+    claims_after: int = 0
+    #: Newly corroborated claims after this iteration.
+    corroborated: int = 0
+    #: 0..1 fraction of this iteration's claims that were genuinely new.
+    novelty: float = 0.0
+    #: 0..1 normalized knowledge growth contributed by this iteration.
+    knowledge_gain: float = 0.0
+    #: Overall confidence after this iteration.
+    confidence: float = 0.0
+    #: Open knowledge gaps remaining after this iteration.
+    gaps_open: int = 0
+
+
+@dataclass
+class Answer:
+    """The direct answer synthesized from the completed knowledge model.
+
+    The answer — not the report — is the primary product of a research run
+    (``OBJECTIVE.md`` principle 1). ``claim_ids`` cite the verified claims the
+    answer rests on, preserving the provenance chain.
+    """
+
+    text: str
+    #: Why the knowledge model supports this answer.
+    reasoning: str = ""
+    confidence: float = 0.0
+    claim_ids: list[str] = field(default_factory=list)
+    #: What remains unknown or uncertain after research.
+    remaining_uncertainty: str = ""
+
+    @property
+    def confidence_label(self) -> str:
+        return confidence_label(self.confidence)
+
+
+@dataclass
 class Source:
     """Provenance for a document.
 
@@ -218,6 +345,18 @@ class RawDocument:
     #: 0..1 topical-relevance score inherited from its accepted candidate.
     relevance_score: float = 0.0
 
+    # -- information-gain scores (stamped by the gain analyzer) -------------
+    #: 0..1 fraction of the document's claims that were new knowledge.
+    novelty_score: float = 0.0
+    #: 0..1 how much the document advanced unanswered subquestions.
+    coverage_score: float = 0.0
+    #: 0..1 fraction of the document's claims that duplicated known claims.
+    redundancy_score: float = 0.0
+    #: Claims contributed per evidence passage (≥ 0).
+    evidence_density: float = 0.0
+    #: 0..1 mean importance of the claims the document contributed.
+    importance_score: float = 0.0
+
 
 @dataclass
 class Evidence:
@@ -273,6 +412,11 @@ class Claim:
     #: Deterministic 0..1 confidence in the claim, with its explanation.
     confidence: float = 0.0
     confidence_explanation: str = ""
+    #: Deterministic 0..1 importance to the research objective (stamped by
+    #: reasoning). Not all information is equally valuable: importance ranks
+    #: claims so high-impact knowledge drives answers and low-value facts
+    #: don't dominate the research process.
+    importance: float = 0.0
 
 
 @dataclass
@@ -426,6 +570,8 @@ class ResearchSession:
     contradictions: list[Contradiction] = field(default_factory=list)
     #: Direct answer to the research question ("" when not answerable).
     direct_answer: str = ""
+    #: The full answer object synthesized from the knowledge model.
+    answer: Answer | None = None
     #: Cross-cutting patterns observed across subquestions.
     patterns: list[str] = field(default_factory=list)
     #: Evidence gaps identified by reasoning (drive the research loop).
@@ -434,6 +580,16 @@ class ResearchSession:
     suggestions: list[str] = field(default_factory=list)
     confidence: ConfidenceReport | None = None
     overall_confidence: float = 0.0
+
+    # -- agent-loop audit trail ---------------------------------------------
+    #: Every search task the adaptive planner emitted, in execution order.
+    search_tasks: list[SearchTask] = field(default_factory=list)
+    #: Every knowledge gap curiosity discovered (investigated or still open).
+    knowledge_gaps: list[KnowledgeGap] = field(default_factory=list)
+    #: Per-iteration information-gain and confidence record.
+    iteration_records: list[IterationRecord] = field(default_factory=list)
+    #: Why research stopped (stopping-engine decision, human-readable).
+    stop_reason: str = ""
 
     # -- research-loop / efficiency statistics -----------------------------
     #: Number of retrieval→verification iterations executed.

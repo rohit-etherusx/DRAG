@@ -1,13 +1,16 @@
-"""Adaptive report generation.
+"""Report rendering.
 
-Renders a :class:`ResearchSession` into a human-readable Markdown report whose
-sections *emerge from the available evidence* (``OBJECTIVE.md`` module 10):
-a section is rendered only when the session contains material for it, and when
-evidence is missing the report says so explicitly instead of padding a
-template. The provenance chain is preserved in print: every finding cites the
-verified claims behind it, every claim cites its evidence passages and
-sources, and every source is listed with its authority assessment. The report
-is fully reproducible from the stored session data.
+A pure presentation layer (``ARCHITECTURE.md`` v0.5): renders the completed
+knowledge model — the answer, the importance-ranked verified claims, the
+findings, the knowledge gaps, and the iteration history — into Markdown. It
+never modifies knowledge, never reads documents, and contains no research
+logic; sections *emerge from the available evidence*, and when evidence is
+missing the report says so explicitly instead of padding a template.
+
+The provenance chain is preserved in print: the answer cites verified claims,
+every finding cites the claims behind it, every claim cites its evidence
+passages and sources, and every source is listed with its authority
+assessment. The report is fully reproducible from the stored session data.
 """
 from __future__ import annotations
 
@@ -19,6 +22,10 @@ from research_engine.domain.models import (
     Source,
     VerificationStatus,
 )
+
+#: Verified claims are ranked by importance; below this rank position the
+#: report groups the tail so low-value facts don't dominate the rendering.
+_TOP_CLAIMS_SHOWN = 25
 
 
 class ReportGenerator:
@@ -40,12 +47,13 @@ class ReportGenerator:
         w("")
 
         self._executive_summary(w, executive_summary)
-        self._direct_answer(w, session)
+        self._answer(w, session)
         self._research_plan(w, session)
         self._key_findings(w, session, claims_by_id, source_labels)
         self._verified_claims(w, session, source_labels)
         self._contradictions(w, session, claims_by_id)
         self._uncertainty(w, session)
+        self._knowledge_gaps(w, session)
         self._limitations(w, session)
         self._future_research(w, session)
         self._recommendations(w, session)
@@ -66,21 +74,31 @@ class ReportGenerator:
         w(executive_summary or "_No summary available._")
         w("")
 
-    def _direct_answer(self, w, session: ResearchSession) -> None:
-        """Rendered only for question-shaped research objectives."""
-        if session.plan is None or not session.plan.is_question:
-            return
-        w("## Direct Answer")
+    def _answer(self, w, session: ResearchSession) -> None:
+        """The answer synthesized from the knowledge model — the product."""
+        is_question = session.plan is not None and session.plan.is_question
+        w("## Direct Answer" if is_question else "## Answer")
         w("")
-        if session.direct_answer:
-            w(session.direct_answer)
+        answer = session.answer
+        if answer is not None and answer.text:
+            w(answer.text)
+            w("")
+            if answer.claim_ids:
+                w(f"*Based on claims: {_claim_citations(answer.claim_ids)}*")
+                w("")
+            if answer.reasoning:
+                w(f"*Reasoning: {answer.reasoning}*")
+                w("")
+            if answer.remaining_uncertainty:
+                w(f"*Remaining uncertainty: {answer.remaining_uncertainty}*")
+                w("")
         else:
             w(
                 "_The verified evidence collected in this session was "
-                "insufficient to answer the question directly. See Missing "
-                "Evidence below._"
+                "insufficient to answer the research objective directly. "
+                "See Missing Evidence below._"
             )
-        w("")
+            w("")
 
     def _research_plan(self, w, session: ResearchSession) -> None:
         if session.plan is None:
@@ -131,18 +149,30 @@ class ReportGenerator:
         w("## Verified Claims")
         w("")
         w(
-            "Each claim lists its type, verification status, and provenance "
-            "(evidence passages → sources)."
+            "Claims are ranked by importance to the research objective. Each "
+            "lists its type, verification status, and provenance (evidence "
+            "passages → sources)."
         )
         w("")
-        for claim in session.claims:
+        ranked = sorted(
+            session.claims, key=lambda c: (-c.importance, c.id)
+        )
+        for claim in ranked[:_TOP_CLAIMS_SHOWN]:
             labels = _labels_for(claim.source_ids, source_labels)
             evidence = ", ".join(claim.evidence_ids) or "-"
             w(
                 f"- (`{claim.id}`) {claim.text} — *{claim.claim_type.value}*, "
+                f"importance {claim.importance:.0%}, "
                 f"**{claim.status.value}** ({claim.supporting_sources} source(s), "
                 f"{claim.independent_domains} domain(s), agreement "
                 f"{claim.agreement:.0%}) [evidence: {evidence} → {labels}]"
+            )
+        remaining = len(ranked) - _TOP_CLAIMS_SHOWN
+        if remaining > 0:
+            w("")
+            w(
+                f"_{remaining} further lower-importance claim(s) are preserved "
+                f"in the session snapshot._"
             )
         w("")
 
@@ -187,6 +217,27 @@ class ReportGenerator:
                     f"- {finding.confidence:.0%} ({finding.confidence_label}) — "
                     f"{finding.statement}"
                 )
+            w("")
+
+    def _knowledge_gaps(self, w, session: ResearchSession) -> None:
+        """What the agent noticed it did not know — investigated and open."""
+        if not session.knowledge_gaps:
+            return
+        w("## Knowledge Gaps")
+        w("")
+        investigated = [g for g in session.knowledge_gaps if g.investigated]
+        open_gaps = [g for g in session.knowledge_gaps if not g.investigated]
+        if investigated:
+            w("Gaps the agent detected and investigated during research:")
+            w("")
+            for gap in investigated:
+                w(f"- (`{gap.id}`, {gap.kind.value}) {gap.description}")
+            w("")
+        if open_gaps:
+            w("Gaps that remain open (research stopped before closing them):")
+            w("")
+            for gap in open_gaps:
+                w(f"- (`{gap.id}`, {gap.kind.value}) {gap.description}")
             w("")
 
     def _limitations(self, w, session: ResearchSession) -> None:
@@ -235,12 +286,34 @@ class ReportGenerator:
             w(f"- {suggestion}")
         w("")
 
+    def _iteration_history(self, w, session: ResearchSession) -> None:
+        """Per-iteration information gain — how the knowledge model grew."""
+        if not session.iteration_records:
+            return
+        w("### Research Iterations")
+        w("")
+        w("| Iter | Searches | Docs | Claims | Novelty | Gain | Confidence | Open gaps |")
+        w("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        for record in session.iteration_records:
+            w(
+                f"| {record.iteration} | {record.search_tasks} "
+                f"| {record.documents_downloaded} "
+                f"| {record.claims_before} → {record.claims_after} "
+                f"| {record.novelty:.0%} | {record.knowledge_gain:.0%} "
+                f"| {record.confidence:.0%} | {record.gaps_open} |"
+            )
+        w("")
+
     def _appendix(self, w, session, source_labels) -> None:
         w("## Appendix")
         w("")
+        self._iteration_history(w, session)
         w("### Retrieval and Verification Statistics")
         w("")
         w(f"- Research-loop iterations: {max(1, session.iterations)}")
+        if session.stop_reason:
+            w(f"- Research stopped because: {session.stop_reason}")
+        w(f"- Search tasks executed: {len(session.search_tasks)}")
         w(f"- Search candidates evaluated: {session.candidates_evaluated}")
         w(
             f"- Candidates rejected before download: "

@@ -1,16 +1,20 @@
 """Reasoning engine.
 
-Operates exclusively on **verified claims**, the evidence graph, and the
-research objective — never on raw documents or webpages (``OBJECTIVE.md``
-module 9). It identifies patterns, weighs contradictions, finds missing
-evidence (which drives the research loop), generates hypotheses, produces
-conclusions — including a direct answer when the input was a question — and
+Operates exclusively on **verified claims**, the knowledge model, and the
+research objective — never on raw documents or webpages. It runs inside every
+research-loop iteration (reasoning drives research, ``OBJECTIVE.md`` principle
+3): it stamps explained confidence on every claim, builds findings per
+subquestion, identifies patterns, weighs contradictions, flags weak
+subquestions (which feed the curiosity engine), generates hypotheses, and
 estimates uncertainty through the deterministic confidence model.
 
-An optional LLM is used only for semantic synthesis (phrasing findings, the
-direct answer, hypotheses, the executive summary) and is always grounded in
-the verified claims it is given; a deterministic fallback exists for every
-step, so the engine reasons end-to-end offline.
+Answer generation and the executive summary live in ``reasoning/answer.py``:
+they consume the *completed* knowledge model once the loop has stopped.
+
+An optional LLM is used only for semantic synthesis (phrasing findings,
+hypotheses) and is always grounded in the verified claims it is given; a
+deterministic fallback exists for every step, so the engine reasons
+end-to-end offline.
 """
 from __future__ import annotations
 
@@ -50,8 +54,6 @@ class ReasoningResult:
     """Everything the reasoning engine derives from the verified claims."""
 
     findings: list[Finding] = field(default_factory=list)
-    #: Direct answer to the research question ("" when not answerable).
-    direct_answer: str = ""
     #: Cross-cutting patterns observed across subquestions.
     patterns: list[str] = field(default_factory=list)
     hypotheses: list[Hypothesis] = field(default_factory=list)
@@ -62,7 +64,6 @@ class ReasoningResult:
     open_questions: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
     confidence: ConfidenceReport = field(default_factory=ConfidenceReport)
-    executive_summary: str = ""
 
 
 class ReasoningEngine:
@@ -126,11 +127,6 @@ class ReasoningEngine:
             plan, claims, contradictions, sources, evidence
         )
         result.confidence = self._confidence.report(overall_inputs)
-
-        # 5. Conclusions: direct answer (for questions) + executive summary.
-        if plan.is_question:
-            result.direct_answer = self._direct_answer(plan, claims)
-        result.executive_summary = self._executive_summary(plan, result)
         return result
 
     # -- confidence inputs --------------------------------------------------
@@ -222,11 +218,14 @@ class ReasoningEngine:
         evidence_by_id: dict[str, Evidence],
     ) -> Finding:
         # Prefer claims whose *primary* subquestion is this one, so findings
-        # stay distinct even when merged claims span several subquestions.
+        # stay distinct even when merged claims span several subquestions;
+        # importance leads within that (principle 5: high-impact knowledge
+        # drives conclusions).
         ranked = sorted(
             supporting,
             key=lambda c: (
                 bool(c.subquestion_ids and c.subquestion_ids[0] == subquestion.id),
+                c.importance,
                 c.confidence,
                 c.supporting_sources,
                 c.id,
@@ -277,39 +276,6 @@ class ReasoningEngine:
         )
         return generated.strip() if generated else deterministic
 
-    # -- direct answer ---------------------------------------------------------
-
-    def _direct_answer(self, plan: ResearchPlan, claims: list[Claim]) -> str:
-        """Answer the research question from the strongest verified claims."""
-        usable = sorted(
-            (
-                c for c in claims
-                if c.claim_type is not ClaimType.OPEN_QUESTION
-                and c.status is not VerificationStatus.CONTRADICTED
-            ),
-            key=lambda c: (c.confidence, c.supporting_sources, c.id),
-            reverse=True,
-        )
-        if not usable:
-            return ""
-        top = usable[:_MAX_CLAIMS_PER_PROMPT]
-        deterministic = " ".join(c.text for c in top[:3])
-        if self._llm is None or not self._llm.available:
-            return deterministic
-        claim_lines = "\n".join(f"- {c.text}" for c in top)
-        prompt = (
-            f"Answer the question below directly, in 2-4 sentences, using ONLY "
-            f"the verified claims provided. Do not add outside facts. If the "
-            f"claims only partially answer it, answer what can be answered and "
-            f"say what remains open.\n\n"
-            f"QUESTION: {plan.question}\n\n"
-            f"VERIFIED CLAIMS:\n{claim_lines}"
-        )
-        generated = self._generate(
-            prompt, system="You answer research questions strictly from verified claims."
-        )
-        return generated.strip() if generated else deterministic
-
     # -- hypotheses --------------------------------------------------------------
 
     def _build_hypotheses(
@@ -355,27 +321,6 @@ class ReasoningEngine:
             )
             for index, text in enumerate(statements[:5], start=1)
         ]
-
-    # -- executive summary --------------------------------------------------------
-
-    def _executive_summary(self, plan: ResearchPlan, result: ReasoningResult) -> str:
-        deterministic = _deterministic_summary(plan, result)
-        if self._llm is None or not self._llm.available:
-            return deterministic
-        finding_lines = "\n".join(f"- {f.statement}" for f in result.findings)
-        answer_line = (
-            f"\nDIRECT ANSWER: {result.direct_answer}" if result.direct_answer else ""
-        )
-        prompt = (
-            f"Write a concise 2-4 sentence executive summary for a research "
-            f"report on '{plan.objective}'. Base it only on these findings and "
-            f"do not invent facts:\n{finding_lines or '- (none)'}{answer_line}\n\n"
-            f"Note the overall confidence is {result.confidence.score:.0%}."
-        )
-        generated = self._generate(
-            prompt, system="You are a precise research synthesis assistant."
-        )
-        return generated or deterministic
 
     def _generate(self, prompt: str, system: str) -> str | None:
         """Call the LLM with a light retry (the model can be nondeterministic)."""
@@ -477,24 +422,6 @@ def _suggestions(
         "verifiable sources."
     )
     return suggestions
-
-
-def _deterministic_summary(plan: ResearchPlan, result: ReasoningResult) -> str:
-    if not result.findings:
-        return (
-            f"This report investigated '{plan.question}', but no verified "
-            f"evidence was collected. The evidence gaps are listed explicitly; "
-            f"see missing evidence and open questions for next steps."
-        )
-    lead = result.direct_answer or result.findings[0].statement
-    return (
-        f"This report investigated '{plan.question}' across "
-        f"{len(plan.subquestions)} subquestions, producing "
-        f"{len(result.findings)} evidence-backed findings at an overall "
-        f"confidence of {result.confidence.score:.0%}. {lead} "
-        f"Confidence is bounded by source diversity and coverage; see the "
-        f"uncertainty section for the factor breakdown."
-    )
 
 
 def _group_by_subquestion(claims: list[Claim]) -> dict[str, list[Claim]]:

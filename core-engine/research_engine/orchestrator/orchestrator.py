@@ -1,45 +1,67 @@
 """Research orchestrator.
 
-The central coordinator. It owns the claim-centric research lifecycle:
+The central coordinator of the autonomous research agent (``ARCHITECTURE.md``
+v0.5). It owns the lifecycle, execution order, iteration control, and stopping
+— and nothing else: no search logic, no extraction logic, no report logic.
 
-    plan → targeted retrieval → candidate evaluation → download → passage
-    extraction → claim extraction → normalization → verification → evidence
-    graph → reasoning → adaptive report → persistence
+Each run is an iterative learning process over a single
+:class:`ResearchState`:
 
-wrapped in the **research loop** (``OBJECTIVE.md``): when overall confidence
-stays below the configured threshold, the engine identifies the subquestions
-with missing or uncorroborated evidence, generates follow-up searches for
-them, and repeats retrieval and verification — terminating only when the
-threshold is reached, the gaps are closed, or the search budget
-(``max_iterations``) is exhausted.
+    plan → research state
+    ┌─► adaptive planning   (search tasks from the plan, then from gaps)
+    │       ↓
+    │   acquisition         (search → candidate gate → download → passages
+    │       ↓                → typed claims)
+    │   knowledge update    (normalize → verify → build graph → importance)
+    │       ↓
+    │   reasoning           (findings, confidence — every iteration)
+    │       ↓
+    │   curiosity           (knowledge gaps → fuel for the next iteration)
+    │       ↓
+    │   information gain    (what this iteration actually taught the engine)
+    │       ↓
+    └── stopping decision   (explicit, recorded reason)
+            ↓
+    answer generation       (from the completed knowledge model)
+            ↓
+    report rendering + persistence
 
-The orchestrator contains no domain-specific logic, and failures are handled
-explicitly: a failed subquestion is recorded on its task and the run continues.
+Failures are handled explicitly at every stage: a failed search task is
+recorded in the state and the run continues.
 """
 from __future__ import annotations
 
 from research_engine.collection.collector import RetrievalManager
 from research_engine.config import EngineConfig
 from research_engine.domain.models import (
+    RawDocument,
     ResearchRequest,
     ResearchSession,
-    Source,
+    SearchTask,
+    Task,
     TaskKind,
     TaskStatus,
 )
-from research_engine.knowledge.graph import EvidenceGraph
+from research_engine.knowledge.builder import KnowledgeBuilder
 from research_engine.logging_setup import get_logger
 from research_engine.planner.planner import ResearchPlanner
-from research_engine.processing.extraction import ExtractedClaim, build_extractor
+from research_engine.processing.extraction import build_extractor
 from research_engine.processing.normalizer import ClaimNormalizer
 from research_engine.processing.processor import EvidenceProcessor
 from research_engine.providers.base import LLMProvider, SearchProvider
 from research_engine.ranking.evaluator import CandidateEvaluator
 from research_engine.ranking.passages import PassageSelector
 from research_engine.reasoning.analyzer import ReasoningEngine, ReasoningResult
+from research_engine.reasoning.answer import AnswerGenerator
+from research_engine.reasoning.curiosity import CuriosityEngine
+from research_engine.reasoning.gain import InformationGainAnalyzer
+from research_engine.reasoning.importance import ImportanceModel
+from research_engine.reasoning.stopping import StoppingEngine
 from research_engine.report.generator import ReportGenerator
+from research_engine.state.research_state import ResearchState
 from research_engine.storage.storage import SessionStorage
 from research_engine.utils import keywords, slugify, utc_now_iso
+from research_engine.verification.equivalence import LLMEquivalenceJudge
 from research_engine.verification.verifier import ClaimVerifier
 
 _log = get_logger("orchestrator")
@@ -64,10 +86,15 @@ class ResearchOrchestrator:
     def run(self, request: ResearchRequest) -> ResearchSession:
         config = self._config
         llm = self._llm if config.llm_enabled else None
-        session = ResearchSession(
-            id=f"session-{slugify(request.topic)}",
+
+        # 1. Understand the question before searching; initialize the state.
+        planner = ResearchPlanner(llm)
+        plan = planner.plan(request)
+        state = ResearchState(
+            session_id=f"session-{slugify(request.topic)}",
             request=request,
-            status=TaskStatus.IN_PROGRESS,
+            plan=plan,
+            tasks=planner.tasks_for(plan).topological_order(),
             created_at=utc_now_iso(),
             provider_info={
                 "search_provider": self._search.name,
@@ -75,23 +102,12 @@ class ResearchOrchestrator:
             },
         )
         _log.info("Starting research session for: %s", request.topic)
-
-        # 1. Understand the question before searching.
-        planner = ResearchPlanner(llm)
-        plan = planner.plan(request)
-        session.plan = plan
-        session.tasks = planner.tasks_for(plan).topological_order()
-        collect_tasks = {
-            task.subquestion_id: task
-            for task in session.tasks
-            if task.kind is TaskKind.COLLECT
-        }
         _log.info(
             "Plan (%s): %d subquestion(s) for objective: %s",
             plan.planner, len(plan.subquestions), plan.objective,
         )
 
-        # 2. Assemble the pipeline stages.
+        # 2. Assemble the pipeline around the state.
         retrieval = RetrievalManager(self._search, config.max_candidates_per_query)
         evaluator = CandidateEvaluator(
             plan,
@@ -113,100 +129,166 @@ class ResearchOrchestrator:
             ),
         )
         normalizer = ClaimNormalizer()
-        verifier = ClaimVerifier()
+        verifier = ClaimVerifier(
+            judge=LLMEquivalenceJudge(llm) if llm is not None else None,
+            max_equivalence_checks=config.max_equivalence_checks,
+        )
+        builder = KnowledgeBuilder()
+        importance = ImportanceModel()
         reasoner = ReasoningEngine(llm)
+        curiosity = CuriosityEngine()
+        gain = InformationGainAnalyzer()
+        stopping = StoppingEngine(
+            confidence_threshold=config.confidence_threshold,
+            min_iteration_gain=config.min_iteration_gain,
+            min_confidence_delta=config.min_confidence_delta,
+            max_iterations=config.max_iterations,
+        )
+        answer_generator = AnswerGenerator(llm)
 
-        # 3. The research loop.
-        sources_by_id: dict[str, Source] = {}
-        extracted: list[ExtractedClaim] = []
+        # 3. The agent loop: search → knowledge update → reason → gaps → stop?
+        collect_tasks = {
+            task.subquestion_id: task
+            for task in state.tasks
+            if task.kind is TaskKind.COLLECT
+        }
         result: ReasoningResult | None = None
-        evidence_graph = EvidenceGraph()
-        target_ids = {sq.id for sq in plan.subquestions}
-        max_iterations = max(1, config.max_iterations)
-
-        for iteration in range(1, max_iterations + 1):
-            session.iterations = iteration
-            self._collect(
-                session, plan, planner, retrieval, evaluator, processor,
-                sources_by_id, extracted, collect_tasks, target_ids, iteration,
+        graph = None
+        for iteration in range(1, max(1, config.max_iterations) + 1):
+            search_tasks = planner.next_search_tasks(
+                state, iteration, config.max_search_tasks_per_iteration
             )
-
-            # Normalize + verify the full accumulated claim set, then reason.
-            session.sources = list(sources_by_id.values())
-            evidence_by_id = {e.id: e for e in session.evidence}
-            claims = normalizer.normalize(extracted, evidence_by_id)
-            if config.verification_enabled:
-                verification = verifier.verify(claims, sources_by_id)
-                claims = verification.claims
-                session.contradictions = verification.contradictions
-                _log.info(
-                    "Verification: %d claim(s), %d corroborated, %d unsupported",
-                    len(claims),
-                    verification.corroborated_claims,
-                    verification.unsupported_claims,
+            if not search_tasks:
+                state.stop_reason = (
+                    "the planner found no further searches worth running"
                 )
-            else:
-                session.contradictions = []
-            session.claims = claims
-
-            evidence_graph = EvidenceGraph()
-            evidence_graph.build(claims, session.evidence)
-
-            result = reasoner.analyze(
-                plan=plan,
-                claims=claims,
-                graph=evidence_graph,
-                contradictions=session.contradictions,
-                sources=sources_by_id,
-                evidence=session.evidence,
-            )
-
-            if result.confidence.score >= config.confidence_threshold:
-                _log.info(
-                    "Confidence %.0f%% reached threshold %.0f%% at iteration %d",
-                    result.confidence.score * 100,
-                    config.confidence_threshold * 100,
-                    iteration,
-                )
-                break
-            target_ids = set(result.weak_subquestion_ids)
-            if not target_ids or iteration == max_iterations:
-                _log.info(
-                    "Stopping at iteration %d (confidence %.0f%%): %s",
-                    iteration,
-                    result.confidence.score * 100,
-                    "no actionable gaps" if not target_ids else "budget exhausted",
-                )
+                _log.info("Stopping before iteration %d: %s",
+                          iteration, state.stop_reason)
                 break
             _log.info(
-                "Confidence %.0f%% below threshold; iterating on %d weak "
-                "subquestion(s)",
-                result.confidence.score * 100,
-                len(target_ids),
+                "Iteration %d: %d search task(s) (%s)",
+                iteration,
+                len(search_tasks),
+                "initial plan" if iteration == 1 else "knowledge gaps",
             )
 
-        # 4. Populate the session from the final reasoning pass.
-        assert result is not None  # loop always runs at least once
-        session.entities = evidence_graph.entities
-        session.graph_nodes = evidence_graph.nodes
-        session.graph_edges = evidence_graph.edges
-        session.findings = result.findings
-        session.hypotheses = result.hypotheses
-        session.direct_answer = result.direct_answer
-        session.patterns = result.patterns
-        session.missing_evidence = result.missing_evidence
-        session.open_questions = result.open_questions
-        session.suggestions = result.suggestions
-        session.confidence = result.confidence
-        session.overall_confidence = result.confidence.score
+            prior_extracted = list(state.extracted_claims)
+            claims_before = len(state.claims)
+            new_documents = self._acquire(
+                state, search_tasks, retrieval, evaluator, processor,
+                collect_tasks, iteration,
+            )
+
+            # Knowledge update over the full accumulated evidence.
+            evidence_by_id = {e.id: e for e in state.evidence}
+            claims = normalizer.normalize(state.extracted_claims, evidence_by_id)
+            if config.verification_enabled:
+                verification = verifier.verify(claims, state.sources_by_id)
+                claims = verification.claims
+                contradictions = verification.contradictions
+                corroborated = verification.corroborated_claims
+                _log.info(
+                    "Verification: %d claim(s), %d corroborated, %d unsupported",
+                    len(claims), corroborated, verification.unsupported_claims,
+                )
+            else:
+                contradictions, corroborated = [], 0
+            graph = builder.build(claims, state.evidence)
+            importance.stamp(claims, plan, graph.entities)
+            state.set_knowledge(
+                claims, contradictions, graph.entities, graph.nodes, graph.edges
+            )
+
+            # Reason over the important claims (low-value facts must not
+            # dominate; fail open if the filter would empty the set).
+            reasoning_claims = [
+                c for c in claims if c.importance >= config.min_claim_importance
+            ] or claims
+            result = reasoner.analyze(
+                plan=plan,
+                claims=reasoning_claims,
+                graph=graph,
+                contradictions=contradictions,
+                sources=state.sources_by_id,
+                evidence=state.evidence,
+            )
+
+            # Curiosity: what is still missing becomes next iteration's fuel.
+            new_gaps = state.add_gaps(
+                curiosity.discover(
+                    plan=plan,
+                    claims=claims,
+                    contradictions=contradictions,
+                    entities=graph.entities,
+                    sources=state.sources_by_id,
+                    active_subquestion_ids=state.active_subquestion_ids,
+                )
+            )
+
+            # Information gain: what did this iteration actually teach us?
+            new_extracted = state.extracted_claims[len(prior_extracted):]
+            record = gain.analyze(
+                iteration=iteration,
+                search_tasks=len(search_tasks),
+                new_documents=new_documents,
+                new_extracted=new_extracted,
+                prior_extracted=prior_extracted,
+                evidence_by_id=evidence_by_id,
+                open_subquestion_ids=state.active_subquestion_ids,
+                verified_claims=claims,
+                claims_before=claims_before,
+                corroborated=corroborated,
+                confidence=result.confidence.score,
+                gaps_open=len(state.open_gaps()),
+            )
+            state.record_iteration(record)
+            _log.info(
+                "Iteration %d: novelty %.0f%%, knowledge gain %.0f%%, "
+                "confidence %.0f%%, %d new gap(s), %d open",
+                iteration, record.novelty * 100, record.knowledge_gain * 100,
+                record.confidence * 100, len(new_gaps), record.gaps_open,
+            )
+
+            decision = stopping.decide(state)
+            if decision.stop:
+                state.stop_reason = decision.reason
+                _log.info("Stopping after iteration %d: %s",
+                          iteration, decision.reason)
+                break
+            _log.info("Continuing research: %s", decision.reason)
+
+        # 4. Answer from the completed knowledge model; render; persist.
+        session = state.to_session()
+        if result is not None:
+            answer = answer_generator.generate(
+                plan=plan,
+                claims=state.claims,
+                confidence=result.confidence,
+                open_gaps=state.open_gaps(),
+            )
+            summary = answer_generator.executive_summary(
+                plan, result.findings, answer, result.confidence
+            )
+            session.findings = result.findings
+            session.hypotheses = result.hypotheses
+            session.patterns = result.patterns
+            session.missing_evidence = result.missing_evidence
+            session.open_questions = result.open_questions
+            session.suggestions = result.suggestions
+            session.confidence = result.confidence
+            session.overall_confidence = result.confidence.score
+            session.answer = answer
+            session.direct_answer = answer.text
+        else:  # the loop never ran a full pass (no search tasks at all)
+            summary = (
+                f"Research on '{plan.question}' produced no executable "
+                f"searches; no evidence was collected."
+            )
         for task in session.tasks:
             if task.kind is TaskKind.SYNTHESIZE:
                 task.status = TaskStatus.COMPLETED
 
-        # 5. Generate and persist the report.
-        session.report = self._report_generator.generate(
-            session, result.executive_summary
-        )
+        session.report = self._report_generator.generate(session, summary)
         session.status = TaskStatus.COMPLETED
         session.completed_at = utc_now_iso()
 
@@ -215,65 +297,61 @@ class ResearchOrchestrator:
         _log.info("Report written to %s", report_path)
         return session
 
-    def _collect(
+    def _acquire(
         self,
-        session: ResearchSession,
-        plan,
-        planner: ResearchPlanner,
+        state: ResearchState,
+        search_tasks: list[SearchTask],
         retrieval: RetrievalManager,
         evaluator: CandidateEvaluator,
         processor: EvidenceProcessor,
-        sources_by_id: dict[str, Source],
-        extracted: list[ExtractedClaim],
-        collect_tasks: dict,
-        target_ids: set[str],
+        collect_tasks: dict[str, Task],
         iteration: int,
-    ) -> None:
-        """One retrieval pass over the targeted subquestions.
+    ) -> list[RawDocument]:
+        """Execute one iteration's search tasks against the state.
 
-        Each subquestion is isolated: retrieval → candidate evaluation →
-        download → passage extraction → claim extraction, with any failure
-        recorded on the subquestion's task without aborting the run.
+        Each task is isolated: search → candidate evaluation → download →
+        passage extraction → claim extraction, with any failure recorded on
+        the state (and the subquestion's collect task) without aborting the
+        iteration. Returns the documents acquired this iteration.
         """
-        for subquestion in plan.subquestions:
-            if subquestion.id not in target_ids:
-                continue
-            task = collect_tasks.get(subquestion.id)
-            if task is None:
-                continue
-            task.status = TaskStatus.IN_PROGRESS
+        acquired: list[RawDocument] = []
+        for search_task in search_tasks:
+            collect_task = collect_tasks.get(search_task.subquestion_id)
+            if collect_task is not None:
+                collect_task.status = TaskStatus.IN_PROGRESS
             try:
-                queries = (
-                    None
-                    if iteration == 1
-                    else planner.follow_up_queries(plan, subquestion, iteration)
+                candidates = retrieval.search(
+                    search_task,
+                    state.visited_urls,
+                    collect_task.id if collect_task else "",
                 )
-                candidates = retrieval.retrieve(subquestion, task, queries)
-                outcome = evaluator.evaluate(candidates, subquestion.question)
-                session.candidates.extend(candidates)
-                session.candidates_evaluated += len(candidates)
-                session.candidates_rejected += len(outcome.rejected)
+                outcome = evaluator.evaluate(candidates, search_task.objective)
+                state.add_candidates(candidates)
 
                 documents = retrieval.download(outcome.accepted)
-                session.documents.extend(documents)
-                session.documents_downloaded += len(documents)
-                for document in documents:
-                    sources_by_id.setdefault(document.source.id, document.source)
+                state.add_documents(documents)
+                acquired.extend(documents)
 
-                evidence, claims = processor.process(
-                    documents, subquestion.question
+                evidence, extracted = processor.process(
+                    documents, search_task.objective
                 )
-                session.evidence.extend(evidence)
-                extracted.extend(claims)
-                task.status = TaskStatus.COMPLETED
+                state.add_evidence(evidence)
+                state.add_extracted_claims(extracted)
+                if collect_task is not None:
+                    collect_task.status = TaskStatus.COMPLETED
                 _log.info(
-                    "%s (iter %d): %d candidate(s), %d accepted, %d downloaded, "
-                    "%d passage(s), %d claim(s)",
-                    subquestion.id, iteration, len(candidates),
+                    "%s (iter %d): %d candidate(s), %d accepted, "
+                    "%d downloaded, %d passage(s), %d claim(s)",
+                    search_task.id, iteration, len(candidates),
                     len(outcome.accepted), len(documents), len(evidence),
-                    len(claims),
+                    len(extracted),
                 )
             except Exception as exc:  # keep the session resilient to a bad source
-                task.status = TaskStatus.FAILED
-                task.error = str(exc)
-                _log.warning("Subquestion %s failed: %s", subquestion.id, exc)
+                state.record_search_failure(
+                    f"{search_task.id} ({search_task.query!r}): {exc}"
+                )
+                if collect_task is not None:
+                    collect_task.status = TaskStatus.FAILED
+                    collect_task.error = str(exc)
+                _log.warning("Search task %s failed: %s", search_task.id, exc)
+        return acquired

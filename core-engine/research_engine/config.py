@@ -124,7 +124,23 @@ class EngineConfig:
     #: Research loop: stop iterating once overall confidence reaches this value.
     confidence_threshold: float = 0.7
     #: Research loop: search budget — maximum retrieval→verification iterations.
-    max_iterations: int = 2
+    max_iterations: int = 3
+
+    # --- v0.5: research intelligence / agent loop --------------------------
+    #: Claims below this 0..1 importance are excluded from reasoning and the
+    #: report (they stay in the session for audit). 0.0 keeps everything.
+    min_claim_importance: float = 0.1
+    #: Stop iterating when an iteration's 0..1 knowledge gain falls below this
+    #: (searching has stopped teaching the engine anything new).
+    min_iteration_gain: float = 0.05
+    #: Stop when overall confidence changed less than this across the last two
+    #: iterations (confidence has stabilized short of the threshold).
+    min_confidence_delta: float = 0.02
+    #: Maximum search tasks the adaptive planner may emit per iteration.
+    max_search_tasks_per_iteration: int = 6
+    #: Maximum borderline claim pairs the semantic equivalence judge reviews
+    #: per verification pass (0 disables the judge even when an LLM is on).
+    max_equivalence_checks: int = 40
 
     #: Logging verbosity.
     log_level: str = "INFO"
@@ -173,6 +189,22 @@ class EngineConfig:
                 "RE_CONFIDENCE_THRESHOLD", cls.confidence_threshold
             ),
             max_iterations=_env_int("RE_MAX_ITERATIONS", cls.max_iterations),
+            min_claim_importance=_env_float(
+                "RE_MIN_CLAIM_IMPORTANCE", cls.min_claim_importance
+            ),
+            min_iteration_gain=_env_float(
+                "RE_MIN_ITERATION_GAIN", cls.min_iteration_gain
+            ),
+            min_confidence_delta=_env_float(
+                "RE_MIN_CONFIDENCE_DELTA", cls.min_confidence_delta
+            ),
+            max_search_tasks_per_iteration=_env_int(
+                "RE_MAX_SEARCH_TASKS_PER_ITERATION",
+                cls.max_search_tasks_per_iteration,
+            ),
+            max_equivalence_checks=_env_int(
+                "RE_MAX_EQUIVALENCE_CHECKS", cls.max_equivalence_checks
+            ),
             log_level=os.environ.get("RE_LOG_LEVEL", cls.log_level),
         )
         for key, value in overrides.items():

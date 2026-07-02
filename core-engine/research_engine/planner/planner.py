@@ -17,20 +17,31 @@ Two strategies produce the plan:
   fallback whenever the LLM output is unusable, keeping planning reproducible.
 
 The planner also derives the executable :class:`TaskGraph` from the plan (one
-collection task per subquestion converging on a synthesis task) and generates
-deterministic follow-up queries for the research loop.
+collection task per subquestion converging on a synthesis task).
+
+**The planner remains active for the entire run** (``ARCHITECTURE.md`` v0.5):
+every research-loop iteration calls :meth:`ResearchPlanner.next_search_tasks`,
+which emits the next prioritized :class:`SearchTask`s — from the initial plan
+on the first iteration, and from the open knowledge gaps the curiosity engine
+discovered afterwards — and terminates research branches (subquestions) that
+have been satisfied. Every search task records why it exists and what
+information it is expected to produce, so retrieval is always explainable.
 """
 from __future__ import annotations
 
 from research_engine.domain.models import (
+    GapKind,
+    KnowledgeGap,
     ResearchPlan,
     ResearchRequest,
+    SearchTask,
     SubQuestion,
     Task,
     TaskKind,
 )
 from research_engine.logging_setup import get_logger
 from research_engine.providers.base import LLMProvider
+from research_engine.state.research_state import ResearchState
 from research_engine.taskgraph.graph import TaskGraph
 from research_engine.utils import keywords, parse_json_object, string_list
 
@@ -67,6 +78,21 @@ _TOPIC_FACETS = [
 
 _MAX_SUBQUESTIONS = 7
 _MAX_QUERIES_PER_SUBQUESTION = 2
+
+#: Query reformulation angles for retrying a query that already ran.
+_QUERY_ANGLES = ["evidence", "explained", "research", "analysis"]
+#: Priority of initial-plan search tasks (gap-driven tasks carry the gap's own
+#: priority instead).
+_INITIAL_TASK_PRIORITY = 0.8
+#: What information each kind of gap-closing search is expected to produce.
+_EXPECTED_INFORMATION = {
+    GapKind.MISSING_EVIDENCE: "evidence answering the subquestion",
+    GapKind.UNCORROBORATED: "independent corroborating sources",
+    GapKind.MISSING_DEFINITION: "a definition of the entity",
+    GapKind.MISSING_RELATIONSHIP: "how the entity relates to the subject",
+    GapKind.CONTRADICTION: "evidence resolving conflicting claims",
+    GapKind.MISSING_PRIMARY_SOURCE: "a primary or authoritative source",
+}
 
 
 class ResearchPlanner:
@@ -118,22 +144,122 @@ class ResearchPlanner:
         )
         return graph
 
-    def follow_up_queries(
-        self, plan: ResearchPlan, subquestion: SubQuestion, iteration: int
-    ) -> list[str]:
-        """Deterministic reformulations for a research-loop iteration.
+    # -- adaptive planning (the planner stays active all run) ----------------
 
-        When evidence for a subquestion is missing or weak, the loop retries
-        retrieval with differently-angled queries rather than repeating the
-        ones that already failed.
+    def next_search_tasks(
+        self, state: ResearchState, iteration: int, limit: int
+    ) -> list[SearchTask]:
+        """Emit the next iteration's prioritized search tasks.
+
+        Iteration 1 executes the initial plan (one task per subquestion search
+        query). Later iterations first terminate satisfied research branches,
+        then convert the highest-priority open knowledge gaps into targeted
+        search tasks. Queries that already ran are deterministically
+        reformulated rather than repeated; emitted tasks are recorded in the
+        research state (which also marks their gaps investigated).
         """
-        angles = ["evidence", "explained", "research", "analysis"]
-        angle = angles[(iteration - 2) % len(angles)]  # iteration 2 -> "evidence"
-        base = " ".join(keywords(subquestion.question, limit=6)) or plan.subject
-        queries = [f"{base} {angle}"]
-        if plan.subject and plan.subject.lower() not in base.lower():
-            queries.append(f"{plan.subject} {angle}")
-        return queries[:_MAX_QUERIES_PER_SUBQUESTION]
+        if iteration <= 1:
+            tasks = self._initial_tasks(state)
+        else:
+            self._terminate_satisfied_branches(state)
+            tasks = self._gap_tasks(state, iteration)
+        tasks = tasks[: max(0, limit)]
+        for index, task in enumerate(tasks, start=1):
+            task.id = f"st-{iteration}-{index}"
+            task.iteration = iteration
+            state.record_search_task(task)
+            if task.gap_id:
+                state.mark_gap_investigated(task.gap_id)
+        return tasks
+
+    def _initial_tasks(self, state: ResearchState) -> list[SearchTask]:
+        tasks: list[SearchTask] = []
+        for subquestion in state.plan.subquestions:
+            queries = subquestion.search_queries or [subquestion.question]
+            for query in queries[:_MAX_QUERIES_PER_SUBQUESTION]:
+                if state.was_query_executed(query):
+                    continue
+                tasks.append(
+                    SearchTask(
+                        id="",
+                        query=query,
+                        objective=subquestion.question,
+                        reason="initial research plan",
+                        expected_information=", ".join(
+                            state.plan.expected_evidence_types[:3]
+                        )
+                        or "evidence answering the subquestion",
+                        priority=_INITIAL_TASK_PRIORITY,
+                        subquestion_id=subquestion.id,
+                    )
+                )
+        return tasks
+
+    def _gap_tasks(self, state: ResearchState, iteration: int) -> list[SearchTask]:
+        """Convert open knowledge gaps into search tasks, best gaps first."""
+        tasks: list[SearchTask] = []
+        for gap in state.open_gaps():
+            if gap.subquestion_id and gap.subquestion_id not in (
+                state.active_subquestion_ids
+            ):
+                continue
+            query = self._fresh_query(state, gap, iteration)
+            if query is None:
+                continue
+            tasks.append(
+                SearchTask(
+                    id="",
+                    query=query,
+                    objective=gap.description,
+                    reason=f"knowledge gap {gap.id} ({gap.kind.value})",
+                    expected_information=_EXPECTED_INFORMATION[gap.kind],
+                    priority=gap.priority,
+                    subquestion_id=gap.subquestion_id,
+                    gap_id=gap.id,
+                )
+            )
+        tasks.sort(key=lambda t: (-t.priority, t.gap_id))
+        return tasks
+
+    def _fresh_query(
+        self, state: ResearchState, gap: KnowledgeGap, iteration: int
+    ) -> str | None:
+        """The gap's query, reformulated if it (or a reformulation) already ran."""
+        base = gap.suggested_query or " ".join(
+            keywords(gap.description, limit=6)
+        )
+        if not base:
+            return None
+        if not state.was_query_executed(base):
+            return base
+        start = (iteration - 2) % len(_QUERY_ANGLES)
+        for offset in range(len(_QUERY_ANGLES)):
+            angle = _QUERY_ANGLES[(start + offset) % len(_QUERY_ANGLES)]
+            candidate = f"{base} {angle}"
+            if not state.was_query_executed(candidate):
+                return candidate
+        return None  # every reformulation already ran; searching again is waste
+
+    def _terminate_satisfied_branches(self, state: ResearchState) -> None:
+        """Complete subquestions that are answered and have no open gaps.
+
+        A branch is satisfied when verified claims support it and no open gap
+        targets it — searching it further cannot add required knowledge.
+        """
+        open_gap_subquestions = {
+            gap.subquestion_id for gap in state.open_gaps() if gap.subquestion_id
+        }
+        for subquestion_id in state.active_subquestion_ids:
+            if subquestion_id in open_gap_subquestions:
+                continue
+            supported = any(
+                subquestion_id in claim.subquestion_ids for claim in state.claims
+            )
+            if supported:
+                state.complete_subquestion(
+                    subquestion_id,
+                    "verified evidence collected and no open knowledge gaps",
+                )
 
     # -- deterministic strategy --------------------------------------------
 

@@ -44,7 +44,7 @@ class ClaimNormalizer:
         order: list[str] = []
         for raw in extracted:
             text = raw.text.strip()
-            signature = _signature(text)
+            signature = claim_signature(text)
             if not signature:
                 continue
             claim = merged.get(signature)
@@ -92,8 +92,12 @@ class ClaimNormalizer:
         _extend_unique(claim.subquestion_ids, [evidence.subquestion_id])
 
 
-def _signature(text: str) -> str:
-    """Order-insensitive content signature used to detect equivalent wordings."""
+def claim_signature(text: str) -> str:
+    """Order-insensitive content signature used to detect equivalent wordings.
+
+    Public because the information-gain analyzer uses the same identity to
+    measure claim novelty — one definition of "the same claim" everywhere.
+    """
     tokens = sorted(
         {
             t for t in _TOKEN_RE.findall(text.lower())

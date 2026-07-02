@@ -1,17 +1,18 @@
 """Retrieval manager.
 
-Executes targeted retrieval for the research plan (``OBJECTIVE.md`` module 2):
-every subquestion's search queries run independently and their candidates are
-merged and de-duplicated, increasing recall while keeping results attributable
-to the subquestion they serve. Downloading is a separate step that operates
-only on candidates accepted by the evaluation gate, so bandwidth is never
-spent on results that were rejected from metadata alone.
+Executes the search tasks the adaptive planner emits: one provider search per
+task, candidates de-duplicated against everything the session has already
+seen. Downloading is a separate step that operates only on candidates accepted
+by the evaluation gate, so bandwidth is never spent on results rejected from
+metadata alone.
 
-The manager performs no reasoning — only acquisition.
+The manager performs no reasoning and keeps no state of its own — the research
+state owns the visited-URL history (single source of truth) and passes it in
+per call.
 """
 from __future__ import annotations
 
-from research_engine.domain.models import RawDocument, SearchCandidate, SubQuestion, Task
+from research_engine.domain.models import RawDocument, SearchCandidate, SearchTask
 from research_engine.logging_setup import get_logger
 from research_engine.providers.base import SearchProvider
 
@@ -19,46 +20,43 @@ _log = get_logger("collection.retrieval")
 
 
 class RetrievalManager:
-    """Retrieves search candidates per subquestion and downloads accepted ones."""
+    """Retrieves search candidates per search task and downloads accepted ones."""
 
     def __init__(self, provider: SearchProvider, candidates_per_query: int) -> None:
         self._provider = provider
         self._candidates_per_query = max(1, candidates_per_query)
-        #: URLs already returned this session (cross-subquestion de-duplication).
-        self._seen_urls: set[str] = set()
 
-    def retrieve(
+    def search(
         self,
-        subquestion: SubQuestion,
-        task: Task,
-        queries: list[str] | None = None,
+        task: SearchTask,
+        exclude_urls: frozenset[str],
+        collect_task_id: str = "",
     ) -> list[SearchCandidate]:
-        """Return merged, de-duplicated candidates for ``subquestion``.
+        """Return new candidates for ``task``, attributed to its subquestion.
 
-        Each search query runs independently; a query failure is logged and
-        skipped so one bad query never empties a subquestion. ``queries``
-        overrides the subquestion's own queries (used by the research loop for
-        follow-up searches). Candidates already retrieved this session (same
-        URL) are dropped so iterations don't re-download known material.
+        Candidates whose URL the session has already seen (``exclude_urls``,
+        owned by the research state) are dropped so iterations never
+        re-acquire known material. A provider failure is logged and returns an
+        empty list — one bad search never aborts an iteration.
         """
-        merged: list[SearchCandidate] = []
-        for query in queries or subquestion.search_queries or [subquestion.question]:
-            try:
-                candidates = self._provider.search_candidates(
-                    query, self._candidates_per_query
-                )
-            except Exception as exc:  # isolate a failing query
-                _log.warning("Search failed for %r: %s", query, exc)
+        try:
+            candidates = self._provider.search_candidates(
+                task.query, self._candidates_per_query
+            )
+        except Exception as exc:  # isolate a failing query
+            _log.warning("Search failed for %r: %s", task.query, exc)
+            return []
+        fresh: list[SearchCandidate] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = candidate.url or candidate.id
+            if key in exclude_urls or key in seen:
                 continue
-            for candidate in candidates:
-                key = candidate.url or candidate.id
-                if key in self._seen_urls:
-                    continue
-                self._seen_urls.add(key)
-                candidate.subquestion_id = subquestion.id
-                candidate.task_id = task.id
-                merged.append(candidate)
-        return merged
+            seen.add(key)
+            candidate.subquestion_id = task.subquestion_id
+            candidate.task_id = collect_task_id or task.id
+            fresh.append(candidate)
+        return fresh
 
     def download(self, candidates: list[SearchCandidate]) -> list[RawDocument]:
         """Download the documents for accepted candidates.
