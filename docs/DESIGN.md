@@ -1,8 +1,11 @@
-# Design Notes — Research Engine v0.1
+# Design Notes — Research Engine v0.3
 
-This document records the concrete design of the v0.1 implementation. It
+This document records the concrete design of the current implementation. It
 complements `ARCHITECTURE.md` (which defines the intended architecture) by
-describing how that architecture is realized in code.
+describing how that architecture is realized in code. v0.3 adds an
+evidence-quality gate (ranking/filtering/passage selection) and a verification +
+deterministic-confidence stage; both fit the existing architecture without any
+interface breakage.
 
 ## Data flow and the shared contract
 
@@ -14,7 +17,9 @@ implementation. The types trace the data flow:
 ResearchRequest
   → Task[]                         (planner + taskgraph)
   → RawDocument[]                  (collection)
+  → RawDocument[] (scored/filtered/trimmed)        (ranking)
   → Source[] + Evidence[]          (processing)
+  → ClaimCluster[]                 (verification)
   → Entity[] + Relationship[]      (knowledge graph)
   → Finding[] + Hypothesis[] + Contradiction[] + open_questions[]  (reasoning)
   → ResearchReport                 (report)
@@ -37,11 +42,25 @@ persistence, guaranteeing a report is reproducible from stored data.
   fanning out across real no-key sources (Wikipedia + arXiv + DuckDuckGo), each
   isolated so one failure never breaks collection; `--offline` selects the
   deterministic stub.
+- **Ranking** *(v0.3)* — the evidence-quality gate between collection and
+  processing. `SourceAuthorityScorer` assigns a deterministic authority tier by
+  domain/provider; a `RelevanceScorer` (heuristic term-coverage by default, LLM
+  drop-in available) scores topical relevance. `DocumentRanker` stamps both,
+  rejects sub-threshold documents (they never reach processing or the graph), and
+  `PassageSelector` trims accepted documents to their relevant passages (fail-open)
+  to cut extraction tokens. Authority informs confidence; relevance is the
+  rejection gate. Disabling ranking reproduces v0.2 behaviour exactly.
 - **Processing** — delegates extraction to a `ClaimExtractor` (LLM-backed over
   real source text — producing claims, entities, and relationships — or a
   deterministic heuristic fallback), then owns the strategy-independent concerns:
   global de-duplication, id assignment, provenance, and negation-based
-  contradiction flagging. Every evidence item keeps its `source_id` and `task_id`.
+  contradiction flagging. Every evidence item keeps its `source_id`, `task_id`,
+  and the relevance of its source document.
+- **Verification** *(v0.3)* — `ClaimClusterer` groups equivalent claims across
+  sources (deterministic token-Jaccard; an LLM clusterer could replace it behind
+  the same signature). `EvidenceVerifier` records, per cluster, the number of
+  independent sources and domains and an `agreement` strength. This corroboration
+  feeds confidence and the report's Evidence Verification section.
 - **Knowledge graph** — upserts entities and relationships. Co-occurrence within
   an evidence item yields generic `related_to` edges; LLM-extracted relationships
   promote those to typed, directed relations. Edge identity is the unordered
@@ -49,10 +68,16 @@ persistence, guaranteeing a report is reproducible from stored data.
 - **Reasoning** — one finding per collection task, synthesized from that angle's
   evidence; hypotheses grounded in the findings and strongest relationships;
   knowledge gaps; and an executive summary. Each LLM path (finding, hypothesis,
-  summary) uses a light retry and has a deterministic fallback; confidence is
-  scaled by source diversity and capped below certainty.
-- **Report** — renders every section required by `PROJECT.md`, preserving
-  citation links from findings → evidence → sources.
+  summary) uses a light retry and has a deterministic fallback. Confidence is now
+  computed by `ConfidenceModel` (`reasoning/confidence.py`) — a pure, deterministic
+  function of measurable inputs (supporting sources, independent domains, mean
+  source authority, claim agreement, contradiction count, mean relevance) with
+  fixed weights, capped below certainty. Identical inputs always yield the
+  identical score.
+- **Report** — renders every section required by `PROJECT.md` plus an Evidence
+  Verification section, preserving citation links from findings → evidence →
+  sources. Findings are synthesized (agreement / disagreement / uncertainty) and
+  citations carry source authority.
 - **Storage** — writes `report/<topic>_report.md` and a JSON session snapshot.
 
 ## Extension points
@@ -63,6 +88,12 @@ for future growth:
 - Implement `SearchProvider` to add a real web/API/document source.
 - Implement `LLMProvider` (or use the included OpenRouter provider) to add
   model-backed synthesis or extraction.
+
+v0.3 adds three more seams, each an interface with a deterministic default:
+`RelevanceScorer` (heuristic or LLM), the claim `ClaimClusterer` (token-similarity
+or a future semantic clusterer), and `ConfidenceModel` (a documented weighting
+that can be tuned or swapped). `SourceAuthorityScorer`'s domain→tier table is a
+single, legible data structure that is trivial to extend.
 
 Reasoning and processing heuristics (entity extraction, contradiction detection,
 finding synthesis) are each localized to a single method so they can be replaced

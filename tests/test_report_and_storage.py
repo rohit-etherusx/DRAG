@@ -24,6 +24,7 @@ _REQUIRED_SECTIONS = [
     "## Research Objectives",
     "## Key Findings",
     "## Supporting Evidence",
+    "## Evidence Verification",
     "## Extracted Entities",
     "## Relationships Between Entities",
     "## Generated Hypotheses",
@@ -67,6 +68,31 @@ class ReportTests(unittest.TestCase):
     def test_findings_cite_sources(self):
         report = ReportGenerator().generate(_session(), "summary")
         self.assertIn("[S1]", report.markdown)
+
+    def test_findings_include_evidence_synthesis(self):
+        report = ReportGenerator().generate(_session(), "summary")
+        # Each finding is annotated with its evidential standing.
+        self.assertIn("*Evidence:", report.markdown)
+        self.assertIn("remaining uncertainty", report.markdown)
+
+    def test_verification_section_reports_corroboration(self):
+        from research_engine.domain.models import ClaimCluster
+        session = _session()
+        session.raw_documents = []  # keep retrieved count deterministic
+        session.claim_clusters = [
+            ClaimCluster(
+                id="cluster-1",
+                canonical_claim="A corroborated fact.",
+                evidence_ids=["ev-1", "ev-2"],
+                source_ids=["src-1", "src-2"],
+                supporting_sources=2,
+                independent_domains=2,
+                agreement=0.5,
+            )
+        ]
+        report = ReportGenerator().generate(session, "summary")
+        self.assertIn("A corroborated fact.", report.markdown)
+        self.assertIn("2 sources", report.markdown)
 
 
 class StorageTests(unittest.TestCase):

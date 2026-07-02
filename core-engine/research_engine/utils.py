@@ -33,6 +33,29 @@ def safe_filename(text: str) -> str:
     return cleaned or "untitled"
 
 
+def domain_of(url: str) -> str:
+    """Return the lowercase network domain of a URL, without a leading ``www.``.
+
+    Returns "" for empty input or non-network locators (e.g. ``local://...``,
+    file paths). Best-effort and dependency-free (stdlib ``urllib``).
+    """
+    if not url:
+        return ""
+    from urllib.parse import urlparse
+
+    netloc = urlparse(url.strip()).netloc.lower()
+    if not netloc:
+        return ""
+    netloc = netloc.split("@")[-1].split(":")[0]  # strip credentials/port
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    # A real network domain contains a dot; this rejects non-web locators such as
+    # ``local://x/0`` (offline provider) whose "host" is just a slug.
+    if "." not in netloc:
+        return ""
+    return netloc
+
+
 def split_sentences(text: str) -> list[str]:
     """Split a block of text into trimmed, non-empty sentences."""
     parts = _SENTENCE_RE.split(text.strip())

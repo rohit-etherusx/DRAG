@@ -62,9 +62,13 @@ class ReasoningTests(unittest.TestCase):
         self.assertTrue(result.findings[0].supporting_evidence_ids)
 
     def test_confidence_stays_below_certainty(self):
-        # 2 distinct sources / (3 + 1) = 0.5
+        # Confidence is computed by the deterministic ConfidenceModel; with no
+        # authority/relevance/verification context it stays modest, and it is
+        # always capped below full certainty. Exact-value behaviour of the model
+        # is covered in test_confidence.py.
         result = self._analyze(docs_per_query=3)
-        self.assertAlmostEqual(result.findings[0].confidence, 0.5)
+        self.assertGreater(result.findings[0].confidence, 0.0)
+        self.assertLessEqual(result.findings[0].confidence, 0.95)
         self.assertLess(result.overall_confidence, 1.0)
 
     def test_generates_hypotheses_from_relationships(self):

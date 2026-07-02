@@ -23,8 +23,10 @@ from research_engine.planner.planner import ResearchPlanner
 from research_engine.processing.extraction import build_extractor
 from research_engine.processing.processor import EvidenceProcessor
 from research_engine.providers.base import LLMProvider, SearchProvider
+from research_engine.ranking.ranker import build_ranker
 from research_engine.reasoning.analyzer import ReasoningEngine
 from research_engine.report.generator import ReportGenerator
+from research_engine.verification.verifier import EvidenceVerifier
 from research_engine.storage.storage import SessionStorage
 from research_engine.utils import keywords, slugify, utc_now_iso
 
@@ -66,17 +68,24 @@ class ResearchOrchestrator:
         graph = self._planner.plan(request)
         session.tasks = graph.topological_order()
 
+        topic_keywords = keywords(request.topic)
         collector = EvidenceCollector(self._search, request.documents_per_query)
+        ranker = build_ranker(
+            self._config, request.topic, topic_keywords, llm=self._llm
+        )
         extractor = build_extractor(
             self._llm,
             request.topic,
-            keywords(request.topic),
+            topic_keywords,
             enabled=self._config.llm_enabled,
         )
         processor = EvidenceProcessor(extractor=extractor)
         sources_by_id: dict[str, Source] = {}
 
-        # Execute collection tasks in dependency order.
+        # Execute collection tasks in dependency order. Each task's documents pass
+        # through the ranking gate (relevance + authority scoring, filtering,
+        # passage selection) before processing, so only genuinely relevant,
+        # trimmed evidence reaches extraction and the knowledge graph.
         for task in session.tasks:
             if task.kind is not TaskKind.COLLECT:
                 continue
@@ -84,11 +93,20 @@ class ResearchOrchestrator:
             try:
                 documents = collector.collect(task)
                 session.raw_documents.extend(documents)
-                for document in documents:
+                outcome = ranker.rank(documents)
+                session.rejected_documents += outcome.rejected
+                # Only accepted sources contribute provenance to the graph/report.
+                for document in outcome.accepted:
                     sources_by_id.setdefault(document.source.id, document.source)
-                session.evidence.extend(processor.process(documents))
+                session.evidence.extend(processor.process(outcome.accepted))
                 task.status = TaskStatus.COMPLETED
-                _log.info("Task %s collected %d document(s)", task.id, len(documents))
+                _log.info(
+                    "Task %s collected %d, accepted %d, rejected %d document(s)",
+                    task.id,
+                    len(documents),
+                    len(outcome.accepted),
+                    outcome.rejected,
+                )
             except Exception as exc:  # keep the session resilient to a bad source
                 task.status = TaskStatus.FAILED
                 task.error = str(exc)
@@ -96,6 +114,18 @@ class ResearchOrchestrator:
 
         session.sources = list(sources_by_id.values())
         session.contradictions = processor.detect_contradictions(session.evidence)
+
+        # Verify: cluster equivalent claims across sources so corroboration
+        # (agreement) can strengthen confidence and be reported explicitly.
+        verification = None
+        if self._config.verification_enabled:
+            verification = EvidenceVerifier().verify(session.evidence, sources_by_id)
+            session.claim_clusters = verification.clusters
+            _log.info(
+                "Verification: %d claim cluster(s), %d corroborated by 2+ sources",
+                len(verification.clusters),
+                verification.corroborated_clusters,
+            )
 
         # Build the knowledge graph: entity co-occurrence plus any explicit
         # relationships the LLM extracted from the sources.
@@ -113,6 +143,8 @@ class ResearchOrchestrator:
             knowledge_graph=knowledge_graph,
             contradictions=session.contradictions,
             documents_per_query=request.documents_per_query,
+            sources=sources_by_id,
+            verification=verification,
         )
         session.findings = result.findings
         session.hypotheses = result.hypotheses

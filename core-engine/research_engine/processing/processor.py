@@ -65,6 +65,7 @@ class EvidenceProcessor:
                     source_id=document.source.id,
                     task_id=document.task_id,
                     entities=claim.entities,
+                    relevance_score=document.relevance_score,
                 )
                 evidence.append(item)
                 doc_evidence_ids.append(item.id)

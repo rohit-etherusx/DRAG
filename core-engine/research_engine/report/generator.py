@@ -23,6 +23,12 @@ class ReportGenerator:
         source_labels = _source_labels(session.sources)
         evidence_by_id = {e.id: e for e in session.evidence}
         entity_names = {e.id: e.name for e in session.entities}
+        sources_by_id = {s.id: s for s in session.sources}
+        cluster_by_evidence = {
+            eid: cluster
+            for cluster in session.claim_clusters
+            for eid in cluster.evidence_ids
+        }
 
         lines: list[str] = []
         w = lines.append
@@ -60,6 +66,11 @@ class ReportGenerator:
                     f"- **[{finding.confidence_label} confidence, "
                     f"{finding.confidence:.0%}]** {finding.statement} {citations}"
                 )
+                synthesis = _finding_synthesis(
+                    finding, evidence_by_id, cluster_by_evidence,
+                    sources_by_id, session.contradictions,
+                )
+                w(f"  - {synthesis}")
         else:
             w("_No findings were produced._")
         w("")
@@ -73,6 +84,37 @@ class ReportGenerator:
                 w(f"- ({item.id}) {item.claim} [{label}]")
         else:
             w("_No evidence collected._")
+        w("")
+
+        # Evidence verification (v0.3): corroboration across independent sources
+        # and the effect of relevance filtering.
+        w("## Evidence Verification")
+        w("")
+        retrieved = len(session.raw_documents)
+        accepted = max(0, retrieved - session.rejected_documents)
+        w(
+            f"Documents retrieved: **{retrieved}**; accepted after relevance "
+            f"filtering: **{accepted}**; rejected as irrelevant: "
+            f"**{session.rejected_documents}**."
+        )
+        w("")
+        corroborated = sorted(
+            (c for c in session.claim_clusters if c.supporting_sources >= 2),
+            key=lambda c: (c.supporting_sources, c.independent_domains, c.agreement),
+            reverse=True,
+        )
+        if corroborated:
+            w("Claims corroborated by two or more independent sources:")
+            w("")
+            for cluster in corroborated:
+                w(
+                    f"- \"{cluster.canonical_claim}\" — "
+                    f"{cluster.supporting_sources} sources, "
+                    f"{cluster.independent_domains} domain(s), "
+                    f"agreement {cluster.agreement:.0%}"
+                )
+        else:
+            w("_No claims were corroborated across multiple independent sources._")
         w("")
 
         # Extracted entities
@@ -158,8 +200,9 @@ class ReportGenerator:
         if session.sources:
             for source in session.sources:
                 label = source_labels.get(source.id, "?")
+                authority = f"{source.authority_tier}, authority {source.authority:.0%}"
                 w(f"- [{label}] *{source.title}* — {source.provider} "
-                  f"(`{source.locator}`)")
+                  f"({authority}) (`{source.locator}`)")
         else:
             w("_No sources._")
         w("")
@@ -181,6 +224,50 @@ class ReportGenerator:
             executive_summary=executive_summary,
             markdown=markdown,
         )
+
+
+def _finding_synthesis(
+    finding,
+    evidence_by_id,
+    cluster_by_evidence,
+    sources_by_id,
+    contradictions,
+) -> str:
+    """Synthesize a finding's evidential standing: agreement, conflict, uncertainty.
+
+    Turns raw citations into a research statement about *where sources agree*,
+    *where they disagree*, and *how much uncertainty remains* — the difference
+    between synthesizing evidence and merely listing it.
+    """
+    ev_ids = finding.supporting_evidence_ids
+    items = [evidence_by_id[e] for e in ev_ids if e in evidence_by_id]
+    source_ids = {i.source_id for i in items}
+    domains = {
+        sources_by_id[s].domain
+        for s in source_ids
+        if s in sources_by_id and sources_by_id[s].domain
+    }
+    corroborated = {
+        cluster_by_evidence[e].id
+        for e in ev_ids
+        if e in cluster_by_evidence and cluster_by_evidence[e].supporting_sources >= 2
+    }
+    conflicts = sum(
+        1 for c in contradictions if set(ev_ids) & set(c.evidence_ids)
+    )
+
+    parts: list[str] = []
+    if len(source_ids) >= 2:
+        dom = f" across {len(domains)} independent domain(s)" if domains else ""
+        parts.append(f"supported by {len(source_ids)} sources{dom}")
+    else:
+        parts.append("single-sourced (treat as preliminary)")
+    if corroborated:
+        parts.append(f"{len(corroborated)} claim(s) independently corroborated")
+    if conflicts:
+        parts.append(f"{conflicts} conflicting claim(s) flagged (see Contradictions)")
+    parts.append(f"remaining uncertainty ~{1 - finding.confidence:.0%}")
+    return "*Evidence: " + "; ".join(parts) + ".*"
 
 
 def _source_labels(sources: list[Source]) -> dict[str, str]:

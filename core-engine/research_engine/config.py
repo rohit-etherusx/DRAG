@@ -51,6 +51,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -92,6 +102,25 @@ class EngineConfig:
     llm_base_url: str = DEFAULT_LLM_BASE_URL
     #: Output-token ceiling for LLM synthesis calls.
     llm_max_tokens: int = 1500
+
+    # --- v0.3: evidence quality / ranking / verification -----------------
+    #: Master switch for the ranking gate (document ranking, authority scoring,
+    #: relevance filtering, passage selection). When off, all retrieved documents
+    #: are processed (v0.2 behaviour) — useful for A/B comparison.
+    ranking_enabled: bool = True
+    #: Minimum 0..1 relevance a document must score to enter processing. Documents
+    #: below this are rejected before extraction (evidence-pollution / token gate).
+    relevance_threshold: float = 0.12
+    #: Optional 0..1 authority gate. 0.0 disables authority-based rejection
+    #: (authority still feeds confidence). Raise to also drop low-authority sources.
+    min_authority: float = 0.0
+    #: Maximum number of passages kept per document for extraction (token budget).
+    max_passages: int = 6
+    #: Minimum 0..1 passage relevance to keep a passage (fail-open if none pass).
+    passage_min_relevance: float = 0.05
+    #: Master switch for claim clustering + evidence verification.
+    verification_enabled: bool = True
+
     #: Logging verbosity.
     log_level: str = "INFO"
 
@@ -118,6 +147,18 @@ class EngineConfig:
                 ("RE_LLM_BASE_URL", "OPENROUTER_BASE_URL"), cls.llm_base_url
             ),
             llm_max_tokens=_env_int("RE_LLM_MAX_TOKENS", cls.llm_max_tokens),
+            ranking_enabled=_env_bool("RE_RANKING_ENABLED", cls.ranking_enabled),
+            relevance_threshold=_env_float(
+                "RE_RELEVANCE_THRESHOLD", cls.relevance_threshold
+            ),
+            min_authority=_env_float("RE_MIN_AUTHORITY", cls.min_authority),
+            max_passages=_env_int("RE_MAX_PASSAGES", cls.max_passages),
+            passage_min_relevance=_env_float(
+                "RE_PASSAGE_MIN_RELEVANCE", cls.passage_min_relevance
+            ),
+            verification_enabled=_env_bool(
+                "RE_VERIFICATION_ENABLED", cls.verification_enabled
+            ),
             log_level=os.environ.get("RE_LOG_LEVEL", cls.log_level),
         )
         for key, value in overrides.items():

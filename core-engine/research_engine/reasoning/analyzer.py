@@ -17,11 +17,17 @@ from research_engine.domain.models import (
     Evidence,
     Finding,
     Hypothesis,
+    Source,
     Task,
     TaskKind,
 )
 from research_engine.knowledge.graph import KnowledgeGraph
+from research_engine.logging_setup import get_logger
 from research_engine.providers.base import LLMProvider
+from research_engine.reasoning.confidence import ConfidenceInputs, ConfidenceModel
+from research_engine.verification.verifier import VerificationResult
+
+_log = get_logger("reasoning.analyzer")
 
 
 @dataclass
@@ -42,6 +48,7 @@ class ReasoningEngine:
     def __init__(self, llm: LLMProvider | None = None, attempts: int = 2) -> None:
         self._llm = llm
         self._attempts = max(1, attempts)
+        self._confidence = ConfidenceModel()
 
     def _generate(self, prompt: str, system: str) -> str | None:
         """Call the LLM with a light retry (the model can be nondeterministic)."""
@@ -62,11 +69,15 @@ class ReasoningEngine:
         knowledge_graph: KnowledgeGraph,
         contradictions: list[Contradiction],
         documents_per_query: int,
+        sources: dict[str, Source] | None = None,
+        verification: VerificationResult | None = None,
     ) -> ReasoningResult:
         result = ReasoningResult()
         by_task = _group_by_task(evidence)
 
-        result.findings = self._build_findings(tasks, by_task, documents_per_query)
+        result.findings = self._build_findings(
+            tasks, by_task, contradictions, sources or {}, verification
+        )
         result.hypotheses = self._build_hypotheses(
             topic, result.findings, knowledge_graph
         )
@@ -88,7 +99,9 @@ class ReasoningEngine:
         self,
         tasks: list[Task],
         by_task: dict[str, list[Evidence]],
-        documents_per_query: int,
+        contradictions: list[Contradiction],
+        sources: dict[str, Source],
+        verification: VerificationResult | None,
     ) -> list[Finding]:
         findings: list[Finding] = []
         index = 0
@@ -99,10 +112,12 @@ class ReasoningEngine:
             if not items:
                 continue
             index += 1
-            distinct_sources = len({e.source_id for e in items})
-            # Scale by (documents_per_query + 1) so confidence stays below
-            # certainty: there is always room for one more corroborating source.
-            confidence = min(1.0, distinct_sources / (documents_per_query + 1))
+            inputs = _confidence_inputs(items, contradictions, sources, verification)
+            confidence = self._confidence.score(inputs)
+            _log.debug(
+                "Finding %d confidence %.3f from %s",
+                index, confidence, self._confidence.breakdown(inputs),
+            )
             angle = _angle(task)
             findings.append(
                 Finding(
@@ -301,6 +316,38 @@ class ReasoningEngine:
             f"Confidence is bounded by source diversity; see the confidence "
             f"assessment and open questions for caveats."
         )
+
+
+def _confidence_inputs(
+    items: list[Evidence],
+    contradictions: list[Contradiction],
+    sources: dict[str, Source],
+    verification: VerificationResult | None,
+) -> ConfidenceInputs:
+    """Derive measurable confidence inputs for one finding's evidence."""
+    source_ids = {e.source_id for e in items}
+    contributing = [sources[sid] for sid in source_ids if sid in sources]
+    domains = {s.domain for s in contributing if s.domain}
+    authorities = [s.authority for s in contributing]
+
+    if verification is not None:
+        agreements = [verification.agreement_for(e.id) for e in items]
+    else:
+        agreements = []
+
+    evidence_ids = {e.id for e in items}
+    contradiction_count = sum(
+        1 for c in contradictions if evidence_ids & set(c.evidence_ids)
+    )
+
+    return ConfidenceInputs(
+        supporting_sources=len(source_ids),
+        independent_domains=len(domains),
+        mean_authority=_mean(authorities),
+        agreement=_mean(agreements),
+        contradictions=contradiction_count,
+        mean_relevance=_mean([e.relevance_score for e in items]),
+    )
 
 
 def _group_by_task(evidence: list[Evidence]) -> dict[str, list[Evidence]]:
