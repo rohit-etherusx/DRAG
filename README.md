@@ -2,16 +2,20 @@
 
 > You give it a topic — or an actual question. It plans an investigation, skims
 > search results like a picky librarian, downloads only what looks worth
-> reading, distills it into claims, checks whether independent sources agree,
-> argues with itself about what's solid, and hands you a cited report. Then it
-> goes back to sleep.
+> reading, distills it into claims, checks whether independent sources agree —
+> and then it notices what it *still* doesn't know, goes looking for exactly
+> that, measures whether it's actually learning anything, and stops with a
+> reason on record. Then you get the answer, with citations, and the report
+> that backs it up.
 
-Research Engine is a **domain-agnostic autonomous research system**. Point it at
+Research Engine is a **domain-agnostic autonomous research agent**. Point it at
 *anything* — "CRISPR gene editing", "the history of the fork", "what are the
-risks of quantum computing to cryptography?" — and it produces a structured
-Markdown report built from **verified claims**: typed assertions extracted from
-real sources, normalized, cross-checked for agreement, and scored with a
-confidence that comes with an explanation instead of a shrug.
+risks of quantum computing to cryptography?" — and it builds an internal
+**knowledge model** out of verified claims: typed assertions extracted from
+real sources, normalized, cross-checked for agreement, ranked by importance,
+and scored with a confidence that comes with an explanation instead of a
+shrug. The answer is synthesized from that model; the report is a rendering
+of it.
 
 **It is not a chatbot.** It will not tell you a joke, validate your feelings, or
 help with your homework at 2am. It has exactly one job: research a topic and
@@ -43,8 +47,8 @@ uv run research-engine "Quantum Computing"
 
 That's it. Go make tea. When you come back there's a report in `report/`.
 
-Want it to actually *think* (LLM-powered planning, extraction, and synthesis)?
-Give it a key:
+Want it to actually *think* (LLM-powered planning, claim extraction,
+equivalence judging, and answer synthesis)? Give it a key:
 
 ```bash
 cp .env.example .env
@@ -147,7 +151,7 @@ like polite coworkers who communicate exclusively via tickets.
       and a clear conscience
 ```
 
-**The golden rule:** every report statement is traceable — finding → claim →
+**The golden rule:** every statement is traceable — answer/finding → claim →
 evidence → document → source — and a report can always be regenerated from its
 stored session snapshot. If the engine can't back it up, it says so explicitly
 in *Limitations and Missing Evidence* instead of padding a template.
@@ -238,6 +242,35 @@ Each subsystem has exactly one job and no opinions about anyone else's.
 | Storage | `storage/` | Saves the report + session snapshot. |
 | Providers | `providers/` | Pluggable two-phase search & LLM backends (the extension seam). |
 
+<details>
+<summary>Repository layout (click to expand)</summary>
+
+```
+core-engine/research_engine/
+├── cli.py · api.py · service.py        user surfaces → service.run_research()
+├── config.py                           every knob, one place (RE_* env vars)
+├── domain/models.py                    the shared contract between subsystems
+├── state/research_state.py             the run's single source of truth
+├── orchestrator/orchestrator.py        the agent loop
+├── planner/planner.py                  plan once, then next_search_tasks() forever
+├── taskgraph/graph.py                  DAG + topological order
+├── collection/collector.py             search tasks → candidates → documents
+├── ranking/                            evaluator (metadata gate) · authority · passages
+├── processing/                         extraction (typed claims) · normalizer · processor
+├── verification/                       clustering (rarity-weighted) · equivalence (LLM judge) · verifier
+├── knowledge/                          builder (alias merge) · graph (typed edges)
+├── reasoning/                          analyzer · confidence · importance · gain ·
+│                                       curiosity · stopping · answer
+├── report/generator.py                 pure renderer
+├── storage/storage.py                  report + session snapshot
+└── providers/                          base interfaces · openrouter · offline ·
+    └── sources/                        wikipedia · arxiv · duckduckgo · composite
+tests/                                  168 network-free unittest tests
+main.py                                 zero-install shim (python3 main.py "topic")
+```
+
+</details>
+
 ---
 
 ## 🔌 Providers (the "swap the engine while driving" part)
@@ -257,11 +290,15 @@ and `LLMProvider` — so you can add new backends without touching the core engi
 - **LLM (default, optional at runtime):** `OpenRouterProvider` speaks OpenRouter's
   OpenAI-compatible API and wakes up automatically when `OPENROUTER_API_KEY` is
   set. It powers the *semantic* steps only: research planning, typed claim
-  extraction, and the phrasing of findings / direct answers / hypotheses /
-  summaries — always grounded in the material it is handed. Flaky model output
-  is met with a light retry, code-fence-tolerant JSON parsing, and a
-  deterministic fallback. Everything measurable (relevance, authority,
-  clustering, agreement, confidence) stays deterministic on principle.
+  extraction, the claim-equivalence judge (deciding whether two borderline
+  claims assert the same fact — a genuinely semantic call no lexical threshold
+  can make), and the phrasing of findings / the answer / hypotheses /
+  summaries — always grounded in the material it is handed, never used as a
+  knowledge source. Flaky model output is met with a light retry,
+  code-fence-tolerant JSON parsing, and a deterministic fallback (the judge
+  fails closed: unusable output means "not equivalent", never a fabricated
+  merge). Everything measurable (relevance, authority, clustering, agreement,
+  importance, gain, stopping, confidence) stays deterministic on principle.
   `--no-llm` forces the deterministic path on purpose.
 
 > 💡 Model choice matters. The LLM is asked for strict JSON; a strong
@@ -292,28 +329,37 @@ uv run research-engine "<topic or question>" [options]
 **Config precedence** (each layer wins over the one before): built-in defaults →
 `.env` file → environment variables → CLI flags. `config.py` is the single source
 of truth. Engine knobs use `RE_*`; the LLM reads `OPENROUTER_API_KEY`,
-`OPENROUTER_MODEL`, `OPENROUTER_BASE_URL`. See `.env.example` for the full list,
-including the claim-pipeline knobs (`RE_MAX_CANDIDATES_PER_QUERY`,
-`RE_CANDIDATE_RELEVANCE_THRESHOLD`, `RE_CONFIDENCE_THRESHOLD`,
-`RE_MAX_ITERATIONS`, …).
+`OPENROUTER_MODEL`, `OPENROUTER_BASE_URL`. See `.env.example` for the full list —
+the claim-pipeline knobs (`RE_MAX_CANDIDATES_PER_QUERY`,
+`RE_CANDIDATE_RELEVANCE_THRESHOLD`, …) plus the v0.5 agent knobs:
+`RE_MIN_CLAIM_IMPORTANCE` (claims below this stay out of reasoning and the
+report), `RE_MIN_ITERATION_GAIN` and `RE_MIN_CONFIDENCE_DELTA` (the "stop when
+no longer learning" thresholds), `RE_MAX_SEARCH_TASKS_PER_ITERATION`, and
+`RE_MAX_EQUIVALENCE_CHECKS` (borderline claim pairs the LLM judge reviews per
+verification pass; `0` disables the judge).
 
 ---
 
 ## 📄 What's in a report
 
 Sections **emerge from the evidence** — nothing renders just because a template
-has a heading for it. A full report can contain: Executive Summary · Direct
-Answer (when you asked a question) · Research Plan · Key Findings ·
-Verified Claims · Contradictions · Uncertainty and Confidence (score + factor
-table + plain-language explanation) · Limitations and Missing Evidence · Future
-Research · Recommendations · Appendix (retrieval statistics, sources, session
-metadata).
+has a heading for it. A full report can contain: Executive Summary · **Answer**
+(a *Direct Answer* for questions, the core understanding for topics — with the
+claims it rests on, the reasoning, and what remains uncertain) · Research Plan ·
+Key Findings · Verified Claims (**ranked by importance**, top 25 in print, the
+rest preserved in the session snapshot) · Contradictions · Uncertainty and
+Confidence (score + factor table + plain-language explanation) · **Knowledge
+Gaps** (what the agent noticed it didn't know — split into *investigated* and
+*still open*) · Limitations and Missing Evidence · Future Research ·
+Recommendations · Appendix (a **Research Iterations** table showing per-pass
+novelty, knowledge gain, and confidence; the recorded **stop reason**;
+retrieval statistics; sources; session metadata).
 
-Findings cite claims (`claim-3`), claims cite their evidence passages and
-sources (`[evidence: ev-7 → S2]`), and sources carry their authority tier.
-Follow the breadcrumbs all the way down; they lead somewhere real. And when the
-engine *couldn't* answer something, the report says exactly that instead of
-mumbling.
+The answer cites claims, findings cite claims (`claim-3`), claims cite their
+evidence passages and sources (`[evidence: ev-7 → S2]`), and sources carry
+their authority tier. Follow the breadcrumbs all the way down; they lead
+somewhere real. And when the engine *couldn't* answer something, the report
+says exactly that instead of mumbling.
 
 ---
 
@@ -374,18 +420,30 @@ The evidence is real, cited, and now cross-checked — but let's not oversell it
 - **"Verification" means cross-source corroboration,** not fact-checking against
   ground truth. If three websites confidently repeat the same mistake, the
   engine will report a well-corroborated mistake (with citations!).
+- **Corroboration is conservative by design.** Auto-merge only accepts
+  near-identical wordings (a false merge *fabricates* corroboration, which is
+  worse than a missed one); the LLM judge reviews the borderline band and
+  fails closed. Real sources rarely assert the same sentence-grain fact in
+  clean paraphrase, so most claims will honestly report `single_source`.
+  Sub-sentence fact alignment is future work.
 - **Candidate relevance is judged from titles and snippets.** That's the point
   (don't download junk), but a great page with a terrible title can get
   rejected at the door. The thresholds are tunable.
 - **Contradiction detection is a negation heuristic.** It catches "X is
   effective" vs "X is not effective." It does not catch subtle intellectual
   disagreement. A semantic detector can drop in behind the same interface.
+- **Extraction quality is model-dependent.** A weak strict-JSON follower
+  triggers the heuristic fallback (one claim per sentence — noisier), which
+  the importance filter then has to absorb. A stronger `OPENROUTER_MODEL` is
+  the cheapest quality upgrade available.
 - **DuckDuckGo scraping is held together with optimism.** No official API; the
-  endpoint and markup can shift. Best-effort, fails closed.
-- **Tokens cost money.** A live LLM run spends tokens on planning, extraction,
-  and synthesis (though far fewer than before — whole documents no longer get
-  shipped to the model). `--offline` and `--no-llm` are the free tier of your
-  own making.
+  endpoint and markup can shift. Best-effort, fails closed. Wikipedia can also
+  rate-limit (HTTP 429) under multi-iteration runs; retry/backoff is queued
+  for the v0.6 networking pass.
+- **Tokens cost money.** A live multi-iteration run spends LLM calls on
+  planning, per-document extraction, borderline-pair judging, per-iteration
+  synthesis, and the final answer (a measured 3-iteration run: ~53 calls).
+  `--offline` and `--no-llm` are the free tier of your own making.
 
 These all live behind interfaces, so future-you can upgrade them without a
 rewrite. See *Technical Debt* in `TASKS.md`.
