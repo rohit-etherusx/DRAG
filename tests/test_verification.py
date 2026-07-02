@@ -9,6 +9,10 @@ from research_engine.domain.models import (
     VerificationStatus,
 )
 from research_engine.verification.clustering import ClaimClusterer
+from research_engine.verification.equivalence import (
+    ClaimEquivalenceJudge,
+    LLMEquivalenceJudge,
+)
 from research_engine.verification.verifier import ClaimVerifier
 
 
@@ -51,6 +55,126 @@ class ClaimClustererTests(unittest.TestCase):
             _claim("c2", "It fails.", ["src-2"]),
         ]
         self.assertEqual(len(clusterer.cluster(claims)), 2)
+
+    def test_conflicting_numbers_never_cluster(self):
+        clusterer = ClaimClusterer()
+        claims = [
+            _claim("c1", "The Transformer achieved 28.4 BLEU on the WMT "
+                         "translation benchmark task.", ["src-1"]),
+            _claim("c2", "The Transformer achieved 41.8 BLEU on the WMT "
+                         "translation benchmark task.", ["src-2"]),
+        ]
+        self.assertEqual(len(clusterer.cluster(claims)), 2)
+
+    def test_generic_topic_overlap_does_not_cluster(self):
+        # Both claims are about transformers/attention but assert different
+        # facts; rarity weighting keeps shared topic words from merging them.
+        clusterer = ClaimClusterer()
+        claims = [
+            _claim("c1", "In 2017 researchers introduced the Transformer "
+                         "architecture in a landmark attention paper.",
+                   ["src-1"]),
+            _claim("c2", "The multi-head attention mechanism is a key "
+                         "component of the Transformer architecture.",
+                   ["src-2"]),
+            _claim("c3", "Wind turbines require regular blade maintenance "
+                         "and periodic gearbox inspection.", ["src-3"]),
+        ]
+        self.assertEqual(len(clusterer.cluster(claims)), 3)
+
+    def test_borderline_pairs_expose_the_undecidable_band(self):
+        clusterer = ClaimClusterer()
+        claims = [
+            _claim("c1", "Self-attention captures long-range dependencies "
+                         "and context in input sequences.", ["src-1"]),
+            _claim("c2", "The self-attention mechanism helps capture the "
+                         "context of words in input sequences.", ["src-2"]),
+            _claim("c3", "Wind turbines require regular blade maintenance.",
+                   ["src-3"]),
+        ]
+        clusters = clusterer.cluster(claims)
+        pairs = clusterer.borderline_pairs(clusters, limit=10)
+        seeds = [(clusters[i][0].id, clusters[j][0].id) for i, j in pairs]
+        self.assertIn(("c1", "c2"), seeds)
+        self.assertNotIn(("c1", "c3"), seeds)
+        self.assertNotIn(("c2", "c3"), seeds)
+
+
+class _StubJudge(ClaimEquivalenceJudge):
+    """Accepts exactly the pairs whose texts are registered as equivalent."""
+
+    def __init__(self, equivalent_texts):
+        self._equivalent = {frozenset(pair) for pair in equivalent_texts}
+        self.seen = []
+
+    def equivalent(self, pairs):
+        self.seen.extend(pairs)
+        return [
+            frozenset((a.text, b.text)) in self._equivalent for a, b in pairs
+        ]
+
+
+class _StubLLM:
+    name = "stub"
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+
+    @property
+    def available(self):
+        return True
+
+    def generate(self, prompt, system=None):
+        return self._responses.pop(0) if self._responses else None
+
+
+class EquivalenceJudgeTests(unittest.TestCase):
+    _PARAPHRASES = [
+        "Self-attention captures long-range dependencies and context in "
+        "input sequences.",
+        "The self-attention mechanism helps capture the context of words "
+        "in input sequences.",
+    ]
+
+    def test_judge_merges_borderline_paraphrases_into_corroboration(self):
+        sources = _sources(["a.org", "b.com"])
+        claims = [
+            _claim("c1", self._PARAPHRASES[0], ["src-1"]),
+            _claim("c2", self._PARAPHRASES[1], ["src-2"]),
+        ]
+        judge = _StubJudge([tuple(self._PARAPHRASES)])
+        result = ClaimVerifier(judge=judge).verify(claims, sources)
+        self.assertEqual(len(result.claims), 1)
+        self.assertEqual(result.claims[0].supporting_sources, 2)
+        self.assertEqual(
+            result.claims[0].status, VerificationStatus.CORROBORATED
+        )
+
+    def test_rejected_verdicts_change_nothing(self):
+        sources = _sources(["a.org", "b.com"])
+        claims = [
+            _claim("c1", self._PARAPHRASES[0], ["src-1"]),
+            _claim("c2", self._PARAPHRASES[1], ["src-2"]),
+        ]
+        judge = _StubJudge([])  # judge refutes every pair
+        result = ClaimVerifier(judge=judge).verify(claims, sources)
+        self.assertEqual(len(result.claims), 2)
+        self.assertTrue(judge.seen)  # the borderline pair was submitted
+
+    def test_llm_judge_parses_strict_json_and_fails_closed(self):
+        claims = [
+            _claim("c1", self._PARAPHRASES[0], ["src-1"]),
+            _claim("c2", self._PARAPHRASES[1], ["src-2"]),
+        ]
+        pair = [(claims[0], claims[1])]
+        accepted = LLMEquivalenceJudge(_StubLLM(['{"equivalent": [0]}']))
+        self.assertEqual(accepted.equivalent(pair), [True])
+        # Unusable output (twice) degrades to "not equivalent".
+        broken = LLMEquivalenceJudge(_StubLLM(["not json", "still not"]))
+        self.assertEqual(broken.equivalent(pair), [False])
+        # Out-of-range indices are ignored rather than crashing.
+        wild = LLMEquivalenceJudge(_StubLLM(['{"equivalent": [7]}']))
+        self.assertEqual(wild.equivalent(pair), [False])
 
 
 class ClaimVerifierTests(unittest.TestCase):

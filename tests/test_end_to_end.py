@@ -114,6 +114,45 @@ class EndToEndTests(unittest.TestCase):
             self.assertLessEqual(session.iterations, 2)
             self.assertGreaterEqual(session.iterations, 1)
 
+    def test_agent_loop_artifacts_are_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, _ = _run(
+                OfflineSearchProvider(), tmp,
+                confidence_threshold=0.99, max_iterations=3,
+            )
+            # Every executed search is an explainable task.
+            self.assertTrue(session.search_tasks)
+            for task in session.search_tasks:
+                self.assertTrue(task.query)
+                self.assertTrue(task.reason)
+            # Iteration records track what each pass taught the engine.
+            self.assertEqual(len(session.iteration_records), session.iterations)
+            first = session.iteration_records[0]
+            self.assertGreater(first.claims_after, 0)
+            self.assertGreater(first.knowledge_gain, 0.0)
+            # The stopping decision is explicit and human-readable.
+            self.assertTrue(session.stop_reason)
+            # Claims carry importance; the answer is synthesized from them.
+            self.assertTrue(any(c.importance > 0 for c in session.claims))
+            self.assertIsNotNone(session.answer)
+            self.assertIn("Research Iterations", session.report.markdown)
+
+    def test_gaps_drive_second_iteration_searches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, _ = _run(
+                OfflineSearchProvider(), tmp,
+                confidence_threshold=0.99, max_iterations=3,
+            )
+            if session.iterations >= 2:
+                gap_driven = [t for t in session.search_tasks if t.gap_id]
+                self.assertTrue(gap_driven)
+                # Gap-driven tasks reference gaps that exist and are marked
+                # investigated.
+                gaps_by_id = {g.id: g for g in session.knowledge_gaps}
+                for task in gap_driven:
+                    self.assertIn(task.gap_id, gaps_by_id)
+                    self.assertTrue(gaps_by_id[task.gap_id].investigated)
+
     def test_run_survives_failing_provider(self):
         with tempfile.TemporaryDirectory() as tmp:
             session, _ = _run(_FailingSearchProvider(), tmp)

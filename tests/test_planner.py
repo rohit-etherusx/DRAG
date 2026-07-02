@@ -3,9 +3,16 @@ import unittest
 
 from tests import _path  # noqa: F401
 
-from research_engine.domain.models import ResearchRequest, TaskKind
+from research_engine.domain.models import (
+    Claim,
+    GapKind,
+    KnowledgeGap,
+    ResearchRequest,
+    TaskKind,
+)
 from research_engine.planner.planner import ResearchPlanner
 from research_engine.providers.base import LLMProvider
+from research_engine.state.research_state import ResearchState
 
 
 class _StubLLM(LLMProvider):
@@ -150,16 +157,91 @@ class TaskGraphDerivationTests(unittest.TestCase):
         # Synthesis converges on every collection task.
         self.assertEqual(set(synth[0].depends_on), {t.id for t in collect})
 
-    def test_follow_up_queries_differ_from_originals_and_are_deterministic(self):
+class AdaptivePlanningTests(unittest.TestCase):
+    def _state(self):
         planner = ResearchPlanner()
-        plan = planner.plan(ResearchRequest(topic="Solar Power", max_subtopics=2))
-        subquestion = plan.subquestions[0]
-        q1 = planner.follow_up_queries(plan, subquestion, iteration=2)
-        q2 = planner.follow_up_queries(plan, subquestion, iteration=2)
-        self.assertEqual(q1, q2)
-        self.assertTrue(q1)
-        for query in q1:
-            self.assertNotIn(query, subquestion.search_queries)
+        request = ResearchRequest(topic="Solar Power", max_subtopics=2)
+        plan = planner.plan(request)
+        state = ResearchState(
+            session_id="session-test",
+            request=request,
+            plan=plan,
+            tasks=planner.tasks_for(plan).topological_order(),
+        )
+        return planner, state
+
+    def test_iteration_one_executes_the_initial_plan(self):
+        planner, state = self._state()
+        tasks = planner.next_search_tasks(state, iteration=1, limit=10)
+        self.assertTrue(tasks)
+        # Every task carries its objective, reason, and subquestion binding.
+        for task in tasks:
+            self.assertTrue(task.query)
+            self.assertTrue(task.objective)
+            self.assertEqual(task.reason, "initial research plan")
+            self.assertTrue(task.subquestion_id)
+        # Tasks were recorded in the state's search history.
+        self.assertTrue(state.was_query_executed(tasks[0].query))
+
+    def test_later_iterations_convert_gaps_into_prioritized_tasks(self):
+        planner, state = self._state()
+        planner.next_search_tasks(state, iteration=1, limit=10)
+        state.add_gaps([
+            KnowledgeGap(
+                id="", kind=GapKind.MISSING_DEFINITION,
+                description="'Inverter' is never defined.",
+                suggested_query="what is Inverter",
+                subquestion_id=state.plan.subquestions[0].id,
+                entity="Inverter", priority=0.7,
+            ),
+            KnowledgeGap(
+                id="", kind=GapKind.MISSING_EVIDENCE,
+                description="No evidence for storage.",
+                suggested_query="solar storage evidence",
+                subquestion_id=state.plan.subquestions[0].id,
+                priority=0.9,
+            ),
+        ])
+        # Keep the subquestion active: give it no claims so it isn't satisfied.
+        tasks = planner.next_search_tasks(state, iteration=2, limit=10)
+        self.assertEqual(len(tasks), 2)
+        # Highest-priority gap first; every emitted gap marked investigated.
+        self.assertEqual(tasks[0].query, "solar storage evidence")
+        self.assertIn("knowledge gap", tasks[0].reason)
+        self.assertTrue(all(g.investigated for g in state.gaps))
+        # A further pass finds no open gaps -> no tasks.
+        self.assertEqual(
+            planner.next_search_tasks(state, iteration=3, limit=10), []
+        )
+
+    def test_executed_queries_are_reformulated_not_repeated(self):
+        planner, state = self._state()
+        planner.next_search_tasks(state, iteration=1, limit=10)
+        first_query = state.search_tasks[0].query
+        state.add_gaps([
+            KnowledgeGap(
+                id="", kind=GapKind.UNCORROBORATED,
+                description="Only one source.",
+                suggested_query=first_query,
+                subquestion_id=state.plan.subquestions[0].id,
+                priority=0.6,
+            ),
+        ])
+        tasks = planner.next_search_tasks(state, iteration=2, limit=10)
+        self.assertEqual(len(tasks), 1)
+        self.assertNotEqual(tasks[0].query, first_query)
+        self.assertIn(first_query, tasks[0].query)  # reformulated, not replaced
+
+    def test_satisfied_branches_are_terminated(self):
+        planner, state = self._state()
+        planner.next_search_tasks(state, iteration=1, limit=10)
+        satisfied = state.plan.subquestions[0].id
+        state.claims.append(
+            Claim(id="claim-1", text="An answer.", subquestion_ids=[satisfied])
+        )
+        planner.next_search_tasks(state, iteration=2, limit=10)
+        self.assertNotIn(satisfied, state.active_subquestion_ids)
+        self.assertIn(satisfied, state.completed_subquestions)
 
 
 if __name__ == "__main__":

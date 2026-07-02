@@ -6,6 +6,7 @@ import unittest
 from tests import _path  # noqa: F401
 
 from research_engine.domain.models import (
+    Answer,
     Claim,
     ClaimType,
     ConfidenceReport,
@@ -114,16 +115,26 @@ class AdaptiveSectionTests(unittest.TestCase):
 
     def test_question_session_renders_direct_answer(self):
         session = _session(is_question=True)
-        session.direct_answer = "The direct answer to the question."
+        session.answer = Answer(
+            text="The direct answer to the question.",
+            reasoning="Synthesized from 1 verified claim.",
+            confidence=0.6,
+            claim_ids=["claim-1"],
+        )
+        session.direct_answer = session.answer.text
         report = ReportGenerator().generate(session, "summary")
         self.assertIn("## Direct Answer", report.markdown)
         self.assertIn("The direct answer to the question.", report.markdown)
+        self.assertIn("Synthesized from 1 verified claim.", report.markdown)
 
     def test_unanswerable_question_is_stated_explicitly(self):
         session = _session(is_question=True)
+        session.answer = None
         session.direct_answer = ""
         report = ReportGenerator().generate(session, "summary")
-        self.assertIn("insufficient to answer the question", report.markdown)
+        self.assertIn(
+            "insufficient to answer the research objective", report.markdown
+        )
 
     def test_future_research_renders_with_hypotheses(self):
         session = _session()

@@ -7,6 +7,8 @@ from research_engine.domain.models import (
     ClaimType,
     Contradiction,
     Evidence,
+    GapKind,
+    KnowledgeGap,
     ResearchPlan,
     Source,
     SubQuestion,
@@ -14,6 +16,7 @@ from research_engine.domain.models import (
 )
 from research_engine.knowledge.graph import EvidenceGraph
 from research_engine.reasoning.analyzer import ReasoningEngine
+from research_engine.reasoning.answer import AnswerGenerator
 
 
 def _plan(is_question=False, subquestions=2):
@@ -126,29 +129,66 @@ class FindingTests(unittest.TestCase):
         )
 
 
-class DirectAnswerTests(unittest.TestCase):
-    def test_question_plan_gets_direct_answer_from_strongest_claims(self):
+class AnswerGeneratorTests(unittest.TestCase):
+    def _answer(self, plan, claims, open_gaps=None):
+        result = _analyze(claims, plan)
+        return AnswerGenerator().generate(
+            plan=plan,
+            claims=claims,
+            confidence=result.confidence,
+            open_gaps=open_gaps or [],
+        )
+
+    def test_question_plan_gets_answer_from_most_important_claims(self):
         plan = _plan(is_question=True)
         claims = [
             _claim("claim-1", "Batteries store solar energy overnight.", ["sq-1"],
                    sources=3, agreement=0.8),
             _claim("claim-2", "Storage lags demand.", ["sq-2"], sources=1),
         ]
-        result = _analyze(claims, plan)
-        self.assertIn("Batteries store solar energy overnight.", result.direct_answer)
+        claims[0].importance = 0.9
+        claims[1].importance = 0.2
+        answer = self._answer(plan, claims)
+        self.assertIn("Batteries store solar energy overnight.", answer.text)
+        self.assertEqual(answer.claim_ids[0], "claim-1")
+        self.assertGreater(answer.confidence, 0.0)
+        self.assertIn("verified", answer.reasoning)
 
-    def test_topic_plan_gets_no_direct_answer(self):
+    def test_topic_plan_also_gets_an_answer(self):
         plan = _plan(is_question=False)
-        claims = [_claim("claim-1", "X.", ["sq-1"], sources=2)]
-        result = _analyze(claims, plan)
-        self.assertEqual(result.direct_answer, "")
+        claims = [_claim("claim-1", "X is the core mechanism.", ["sq-1"], sources=2)]
+        answer = self._answer(plan, claims)
+        self.assertIn("X is the core mechanism.", answer.text)
 
     def test_no_usable_claims_yields_empty_answer(self):
         plan = _plan(is_question=True, subquestions=1)
-        result = _analyze([], plan)
-        self.assertEqual(result.direct_answer, "")
-        self.assertEqual(result.findings, [])
-        self.assertEqual(result.confidence.score, 0.0)
+        answer = self._answer(plan, [])
+        self.assertEqual(answer.text, "")
+        self.assertEqual(answer.confidence, 0.0)
+        self.assertIn("No verified claims", answer.reasoning)
+
+    def test_contradicted_claims_cannot_support_the_answer(self):
+        plan = _plan(is_question=True, subquestions=1)
+        claims = [
+            _claim("claim-1", "Disputed statement.", ["sq-1"], sources=2,
+                   contradicts=["claim-2"]),
+            _claim("claim-2", "Reliable statement.", ["sq-1"], sources=2,
+                   agreement=0.5),
+        ]
+        answer = self._answer(plan, claims)
+        self.assertNotIn("claim-1", answer.claim_ids)
+        self.assertIn("Reliable statement.", answer.text)
+
+    def test_open_gaps_become_remaining_uncertainty(self):
+        plan = _plan(is_question=True, subquestions=1)
+        claims = [_claim("claim-1", "X.", ["sq-1"], sources=2)]
+        gap = KnowledgeGap(
+            id="gap-1",
+            kind=GapKind.MISSING_DEFINITION,
+            description="'Inverter' is never defined.",
+        )
+        answer = self._answer(plan, claims, open_gaps=[gap])
+        self.assertIn("Inverter", answer.remaining_uncertainty)
 
 
 class DerivationTests(unittest.TestCase):
@@ -214,7 +254,14 @@ class DerivationTests(unittest.TestCase):
         plan = _plan(subquestions=1)
         claims = [_claim("claim-1", "X works.", ["sq-1"], sources=2)]
         result = _analyze(claims, plan)
-        self.assertIn(plan.question, result.executive_summary)
+        generator = AnswerGenerator()
+        answer = generator.generate(
+            plan=plan, claims=claims, confidence=result.confidence, open_gaps=[]
+        )
+        summary = generator.executive_summary(
+            plan, result.findings, answer, result.confidence
+        )
+        self.assertIn(plan.question, summary)
 
 
 if __name__ == "__main__":
