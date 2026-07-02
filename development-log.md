@@ -8,6 +8,105 @@ and what remains. Newest entries first.
 
 ---
 
+## Entry 5 — v0.5: autonomous research agent (T70–T84)
+
+**Date:** 2026-07-02
+
+### Completed
+
+The knowledge-first agent rewrite mandated by `OBJECTIVE.md` v0.5: research is
+now an iterative learning loop over a persistent research state; the answer is
+the product and the report is a rendering of the knowledge model.
+
+- **T70–T71 contracts + config**: new domain models (`KnowledgeGap`/`GapKind`,
+  `SearchTask` with objective/reason/expected-information/priority,
+  `IterationRecord`, `Answer`; `Claim.importance`; per-document gain scores;
+  session additions: `answer`, `search_tasks`, `knowledge_gaps`,
+  `iteration_records`, `stop_reason`). New knobs: `min_claim_importance`,
+  `min_iteration_gain`, `min_confidence_delta`,
+  `max_search_tasks_per_iteration`, `max_equivalence_checks`;
+  `max_iterations` default raised to 3.
+- **T72 ResearchState** (`state/`): the single source of truth during a run —
+  subquestion lifecycle, search history + visited URLs + failures, all
+  acquired artifacts, the knowledge model, gap queue (identity-deduped),
+  iteration records, confidence history; `to_session()` renders the snapshot.
+  `RetrievalManager` became stateless accordingly.
+- **T73 verification upgrade** (root-caused from a live run that corroborated
+  0/100 then 1/164 claims): rarity-weighted (in-run IDF) Jaccard clustering
+  with polarity and numeric-conflict guards — conservative auto-merge — plus a
+  borderline band submitted to a new `LLMEquivalenceJudge`
+  (`verification/equivalence.py`, one strict-JSON call, union-find merge,
+  fails closed to "not equivalent"). Offline behavior stays deterministic.
+- **T74 claim importance** (`reasoning/importance.py`): deterministic 0..1
+  score (type value, objective relevance, entity centrality, corroboration);
+  filters reasoning input, ranks answer support, orders the report.
+- **T75 knowledge builder** (`knowledge/builder.py`): entity alias merging
+  (case/possessive/naive-plural; most frequent spelling wins) before graph
+  construction via the existing `EvidenceGraph`.
+- **T76 information gain** (`reasoning/gain.py`): per-document novelty /
+  coverage / redundancy / evidence-density / importance (claim identity =
+  `claim_signature`); per-iteration novelty + knowledge gain records.
+- **T77 curiosity** (`reasoning/curiosity.py`): gaps for missing/uncorroborated
+  subquestion evidence, undefined or unconnected central entities,
+  contradictions, and important claims lacking authoritative sources — each
+  with a suggested query and priority.
+- **T78 adaptive planner**: `next_search_tasks(state)` — initial plan on
+  iteration 1, prioritized gap-driven tasks afterwards, deterministic query
+  reformulation instead of repeats, satisfied-branch termination. Replaces
+  `follow_up_queries`.
+- **T79 stopping engine** (`reasoning/stopping.py`): explicit, recorded
+  decisions — confidence target · no actionable gaps · budget · negligible
+  gain · confidence stabilized.
+- **T80 answer generator** (`reasoning/answer.py`): `Answer` (text, reasoning,
+  confidence, claim citations, remaining uncertainty) synthesized from the
+  importance-ranked knowledge model for questions *and* topics; executive
+  summary moved here from the analyzer.
+- **T81 orchestrator rewrite**: the agent loop (plan → state → search tasks →
+  acquire → verify → build knowledge → importance → reason → curiosity → gain
+  → stopping), then answer, report, persistence. `run_research`/CLI/API
+  surfaces unchanged.
+- **T82 report renderer**: Answer section (citations + reasoning + remaining
+  uncertainty), importance-ordered Verified Claims, Knowledge Gaps
+  (investigated vs. open), Research Iterations table + stop reason in the
+  appendix.
+- **T83 tests**: 125 → **168** network-free tests — new suites for state,
+  importance/gain/curiosity/stopping, knowledge builder, equivalence judge and
+  clustering guards; planner/reasoning/report suites updated to the replaced
+  interfaces; e2e now asserts agent-loop artifacts (search-task audit,
+  iteration records, stop reason, gap-driven second-iteration searches,
+  determinism).
+- **T84 docs**: `docs/DESIGN.md` rewritten for v0.5, `README.md` updated,
+  `.env.example` extended, version bumped to 0.5.0.
+
+### Notes / carried debt
+
+- Wikipedia 429 rate-limiting under multi-iteration runs is recorded as v0.6
+  networking scope (retry/backoff is a performance concern, out of v0.5 scope).
+- Contradiction detection remains the deterministic negation/overlap
+  heuristic; the equivalence-judge seam shows where a semantic version drops
+  in.
+- ~~Pending sign-off~~ **Live grounded run completed** (2026-07-02, topic
+  "quantum tunneling", web sources + `deepseek/deepseek-v4-flash`, ~16 min):
+  - Agent loop: 3 iterations; iter 2 ran 6 gap-driven searches (from 6 gaps:
+    2 missing-evidence, 3 uncorroborated, 2 contradictions), iter 3 ran 2 and
+    found nothing new → stopped with recorded reason **"no actionable
+    knowledge gaps remain"** (v0.4 stopped only on budget exhaustion).
+  - Information gain tracked the learning curve: novelty 100%→100%→0%, gain
+    100%→21%→0%, confidence 43%→49%→49%.
+  - Verification: 161 claims, **3 corroborated with genuine cross-source
+    paraphrase variants** (e.g. two independent definitions of tunneling) and
+    zero observed false merges. The equivalence judge reviewed 13–17
+    borderline pairs per pass and accepted 3 — selective, as designed. v0.4's
+    same-scale run: 164 claims, 1 corroborated (a fabricated merge risk).
+  - Claim importance ranked definitions of tunneling/QM at the top (0.61…)
+    and boilerplate at the bottom; the answer cited the top-importance claims.
+  - Extraction fallback fired on 3 of 21 documents (model-dependent strict-JSON
+    quality, known debt); importance filtering absorbed the resulting noise.
+  - Corroboration rate (3/161) remains bounded by real cross-source paraphrase
+    scarcity at sentence grain — sub-sentence fact alignment is future work.
+
+---
+
 ## Entry 4 — v0.4: claim-centric architecture rewrite (T53–T69)
 
 **Date:** 2026-07-02

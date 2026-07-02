@@ -19,10 +19,13 @@ leave a paper trail. Every statement in the report traces back through
 finding → claim → evidence passage → document → source. It's the difference
 between "trust me bro" and "here's my citation [S1]".
 
-**Status:** **v0.4 — Claim-Centric Research.** Documents are no longer the unit
-of reasoning; claims are. The engine now evaluates search results *before*
-downloading them, reasons only over verified claims, answers questions directly
-when you ask one, and loops back for more evidence when confidence is low.
+**Status:** **v0.5 — Autonomous Research Agent.** The engine no longer runs a
+pipeline and calls it a day; it runs a *learning loop*. It keeps a single
+research state, notices what it doesn't know (missing definitions, single-source
+claims, contradictions), turns those gaps into new targeted searches, measures
+how much every iteration actually taught it, and stops when it's confident,
+out of gaps, or demonstrably no longer learning — with the reason on record.
+The answer is the product; the report is a rendering of the knowledge model.
 (The character-building journey here is in [The Backstory](#-the-backstory).)
 
 ---
@@ -115,25 +118,32 @@ like polite coworkers who communicate exclusively via tickets.
    └──────────┬────────────┘  only one source asserts. Stamp it all on the claim.
               ▼
    ┌───────────────────────┐
-   │  7. EVIDENCE GRAPH    │  Claims become the primary nodes; evidence,
-   │  knowledge/           │  documents, entities orbit them. Typed edges:
-   └──────────┬────────────┘  supports/contradicts/extends/depends_on/defines.
+   │  7. BUILD KNOWLEDGE   │  Merge entity aliases, rebuild the claim-primary
+   │  knowledge/           │  graph (typed edges: supports/contradicts/extends/
+   │                       │  depends_on/defines), and stamp every claim's
+   └──────────┬────────────┘  IMPORTANCE — not all information is equal.
               ▼
    ┌───────────────────────┐
-   │  8. REASON            │  Over verified claims ONLY: findings per
-   │  reasoning/           │  subquestion, a direct answer if you asked a
-   │                       │  question, patterns, gaps, hypotheses, and
-   └──────────┬────────────┘  deterministic confidence WITH an explanation.
+   │  8. REASON + WONDER   │  Findings per subquestion + explained confidence
+   │  reasoning/           │  (every iteration). Then curiosity kicks in: what's
+   │                       │  never defined? single-sourced? contradicted? Each
+   └──────────┬────────────┘  gap gets a suggested query and a priority.
               ▼
-        confidence below threshold and gaps to fill?
-              │ yes → generate follow-up searches, GOTO 2 (the research loop)
-              ▼ no
    ┌───────────────────────┐
-   │  9. REPORT + PERSIST  │  Adaptive Markdown report — sections appear only
-   │  report/ storage/     │  when evidence supports them; missing evidence is
-   └──────────┬────────────┘  stated out loud. Save report + session snapshot.
+   │  9. STOP OR LOOP?     │  Measure what this iteration actually taught the
+   │  reasoning/           │  engine (novelty, knowledge gain). Stop when
+   │                       │  confident, out of gaps, out of budget, or no
+   └──────────┬────────────┘  longer learning — reason recorded. Else: the
+              │               planner turns the best gaps into new searches,
+              │ loop          GOTO 2.
+              ▼ stop
+   ┌───────────────────────┐
+   │  10. ANSWER + REPORT  │  Synthesize the answer from the completed
+   │  reasoning/ report/   │  knowledge model (citations included), then render
+   │  storage/             │  the adaptive Markdown report — gaps, iteration
+   └──────────┬────────────┘  history, and stop reason stated out loud.
               ▼
-        a cited report,
+        a cited answer,
       and a clear conscience
 ```
 
@@ -170,24 +180,31 @@ relay race that follows, baton-pass by baton-pass:
       │     LLM plan as strict JSON, or the deterministic question-aware planner
       ├─ planner.tasks_for(plan)           taskgraph/graph.py    → ordered Task[]
       │
-      ├─ research loop (until confident, out of gaps, or out of budget):
-      │     for each (weak) subquestion:
-      │       ├─ retrieval.retrieve(sq)      collection/collector.py
-      │       │     └─ provider.search_candidates()   ← metadata only
-      │       ├─ evaluator.evaluate(...)     ranking/evaluator.py
-      │       │     relevance + authority + exclusions, judged from snippets
-      │       ├─ retrieval.download(accepted)
-      │       │     └─ provider.fetch()      ← the ONLY place pages are fetched
-      │       └─ processor.process(docs)     processing/processor.py
-      │             ├─ PassageSelector       ranking/passages.py
-      │             └─ ClaimExtractor        processing/extraction.py (typed JSON)
-      │     ├─ normalizer.normalize(...)     processing/normalizer.py
-      │     ├─ verifier.verify(...)          verification/verifier.py
-      │     ├─ EvidenceGraph.build(...)      knowledge/graph.py
-      │     └─ reasoner.analyze(...)         reasoning/analyzer.py
-      │           findings, direct answer, patterns, gaps, hypotheses,
-      │           ConfidenceModel.report(...)   reasoning/confidence.py
+      ├─ ResearchState(...)                state/research_state.py
+      │     the single source of truth the whole loop reads and writes
       │
+      ├─ agent loop (until the stopping engine says stop):
+      │     ├─ planner.next_search_tasks(state)   planner/planner.py
+      │     │     iteration 1: the plan · later: open knowledge gaps,
+      │     │     prioritized, deduped against the search history
+      │     ├─ for each search task:
+      │     │   ├─ retrieval.search(task)     collection/collector.py
+      │     │   │     └─ provider.search_candidates()   ← metadata only
+      │     │   ├─ evaluator.evaluate(...)    ranking/evaluator.py
+      │     │   ├─ retrieval.download(accepted)
+      │     │   │     └─ provider.fetch()     ← the ONLY place pages are fetched
+      │     │   └─ processor.process(docs)    processing/processor.py
+      │     ├─ normalizer.normalize(...)      processing/normalizer.py
+      │     ├─ verifier.verify(...)           verification/verifier.py
+      │     │     + LLM equivalence judge for borderline paraphrase pairs
+      │     ├─ builder.build(...)             knowledge/builder.py
+      │     ├─ importance.stamp(...)          reasoning/importance.py
+      │     ├─ reasoner.analyze(...)          reasoning/analyzer.py
+      │     ├─ curiosity.discover(...)        reasoning/curiosity.py → gaps
+      │     ├─ gain.analyze(...)              reasoning/gain.py → IterationRecord
+      │     └─ stopping.decide(state)         reasoning/stopping.py
+      │
+      ├─ answer_generator.generate(...)    reasoning/answer.py    → Answer
       ├─ report_generator.generate(…)      report/generator.py    → Markdown
       └─ storage.save_report() / save_session()   storage/storage.py
 
@@ -207,16 +224,17 @@ Each subsystem has exactly one job and no opinions about anyone else's.
 
 | Subsystem | Package | Its one job |
 |-----------|---------|-------------|
-| Orchestrator | `orchestrator/` | Runs the show + the research loop; keeps calm when a source dies. |
-| Planner | `planner/` | Understands the question; produces the structured research plan. |
+| Orchestrator | `orchestrator/` | Runs the agent loop; keeps calm when a source dies. |
+| Research state | `state/` | The single source of truth during a run — everything reads from it, writes through it. |
+| Planner | `planner/` | Understands the question; stays active all run, turning gaps into prioritized search tasks. |
 | Task graph | `taskgraph/` | A DAG with dependency-ordered execution and cycle detection. |
-| Retrieval | `collection/` | Per-subquestion searches; downloads *accepted* candidates only. |
+| Retrieval | `collection/` | Executes search tasks; downloads *accepted* candidates only. Stateless. |
 | Evaluation | `ranking/` | Judges candidates from metadata; authority scoring; passage selection. |
 | Processing | `processing/` | Passages → typed claims → normalized canonical claims. |
-| Verification | `verification/` | Clusters claims across sources; agreement, contradictions, unsupported. |
-| Evidence graph | `knowledge/` | Claim-primary graph with typed edges. The session's memory. |
-| Reasoning | `reasoning/` | Findings, direct answers, patterns, gaps, hypotheses, explained confidence. |
-| Report | `report/` | Renders adaptive Markdown, citation chain intact. |
+| Verification | `verification/` | Clusters claims across sources (rarity-weighted + LLM equivalence judge); agreement, contradictions. |
+| Knowledge | `knowledge/` | Builds the knowledge model: entity alias merging + the claim-primary typed graph. |
+| Reasoning | `reasoning/` | Findings, confidence, claim importance, curiosity (gaps), information gain, stopping, the answer. |
+| Report | `report/` | Renders the knowledge model as adaptive Markdown, citation chain intact. |
 | Storage | `storage/` | Saves the report + session snapshot. |
 | Providers | `providers/` | Pluggable two-phase search & LLM backends (the extension seam). |
 
@@ -262,7 +280,7 @@ uv run research-engine "<topic or question>" [options]
 |------|--------------|---------|
 | `--max-subtopics N` | How many subquestions to investigate (1–7). | 6 |
 | `--documents-per-query N` | Accepted candidates downloaded per subquestion. | 3 |
-| `--max-iterations N` | Research-loop search budget (retrieval passes). | 2 |
+| `--max-iterations N` | Agent-loop search budget (iterations). | 3 |
 | `--confidence-threshold X` | Stop looping once overall confidence ≥ X (0–1). | 0.7 |
 | `--offline` | Deterministic offline source, no network (evidence is synthetic). | off |
 | `--no-llm` | Deterministic planning/extraction/synthesis, skip the LLM. | off |
@@ -341,10 +359,11 @@ whatever the CLI produces, the API produces — just JSON-shaped.
 uv run python -m unittest discover -s tests
 ```
 
-Stdlib `unittest`, no external runner, **125 tests**, all network-free (the
+Stdlib `unittest`, no external runner, **168 tests**, all network-free (the
 source providers are tested with injected fake fetchers, so the suite never
 actually hits Wikipedia). Covers every subsystem plus full offline end-to-end
-runs — including determinism across runs and the research loop's budget.
+runs — including determinism across runs, gap-driven iteration, explicit stop
+reasons, and the agent loop's budget.
 
 ---
 
@@ -387,12 +406,24 @@ interfaces and shared models, it was a transplant, not an autopsy.
 passage selection, claim clustering across sources, and deterministic
 confidence. Evidence quality went from "everything counts" to "prove it."
 
-**v0.4 (now)** made claims the star of the show. Documents are just containers.
+**v0.4** made claims the star of the show. Documents are just containers.
 The engine plans before it searches, judges results before it downloads them,
 extracts typed claims instead of summaries, verifies claims against each other,
 reasons over an evidence graph, answers questions directly, explains its
 confidence factor by factor, and loops back for more evidence when it isn't
 confident enough. The report finally has the nerve to leave sections out.
+
+**v0.5 (now)** turned the pipeline into an agent. One `ResearchState` holds
+everything; the planner never clocks out; curiosity converts what's missing
+(undefined entities, single-source claims, contradictions, low-authority
+evidence) into the next iteration's searches; every claim gets an importance
+score so trivia stops crowding out concepts; every iteration gets a
+knowledge-gain score so the engine can tell when it's learning versus
+spinning; and a stopping engine ends the run with an explicit, recorded
+reason. Live-run diagnosis also fixed verification: rarity-weighted claim
+clustering plus an LLM equivalence judge for the borderline pairs plain
+lexical similarity can't decide — the difference between corroborating ~0% of
+claims and actually noticing when independent sources agree.
 
 ---
 
