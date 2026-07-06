@@ -186,7 +186,7 @@ class ResearchOrchestrator:
         )
         builder = KnowledgeBuilder()
         importance = ImportanceModel()
-        reasoner = ReasoningEngine(llm)
+        reasoner = ReasoningEngine(llm, max_workers=config.max_workers)
         curiosity = CuriosityEngine()
         gain = InformationGainAnalyzer()
         stopping = StoppingEngine(
@@ -255,15 +255,17 @@ class ResearchOrchestrator:
                 claims, contradictions, graph.entities, graph.nodes, graph.edges
             )
 
-            # Reason over the important claims (low-value facts must not
-            # dominate; fail open if the filter would empty the set).
+            # Score confidence each iteration (deterministic, LLM-free) for the
+            # gain/stopping decision. The full narrative reasoning (LLM findings
+            # + hypotheses) is generated once after the loop — regenerating it
+            # every iteration only to discard all but the last was the loop's
+            # dominant sequential cost.
             reasoning_claims = [
                 c for c in claims if c.importance >= config.min_claim_importance
             ] or claims
-            result = reasoner.analyze(
+            iteration_confidence = reasoner.assess_confidence(
                 plan=plan,
                 claims=reasoning_claims,
-                graph=graph,
                 contradictions=contradictions,
                 sources=state.sources_by_id,
                 evidence=state.evidence,
@@ -294,7 +296,7 @@ class ResearchOrchestrator:
                 verified_claims=claims,
                 claims_before=claims_before,
                 corroborated=corroborated,
-                confidence=result.confidence.score,
+                confidence=iteration_confidence.score,
                 gaps_open=len(state.open_gaps()),
             )
             state.record_iteration(record)
@@ -318,7 +320,23 @@ class ResearchOrchestrator:
                 break
             _log.info("Continuing research: %s", decision.reason)
 
-        # 4. Answer from the completed knowledge model; render; persist.
+        # 4. Narrate once over the final knowledge model, then answer, render,
+        #    persist. Running the LLM reasoning a single time (rather than every
+        #    iteration) is safe: only the final iteration's findings were ever
+        #    kept, and the loop's stopping used the deterministic confidence.
+        if graph is not None:
+            final_claims = [
+                c for c in state.claims if c.importance >= config.min_claim_importance
+            ] or state.claims
+            result = reasoner.analyze(
+                plan=plan,
+                claims=final_claims,
+                graph=graph,
+                contradictions=state.contradictions,
+                sources=state.sources_by_id,
+                evidence=state.evidence,
+            )
+
         session = state.to_session()
         if result is not None:
             answer = answer_generator.generate(
