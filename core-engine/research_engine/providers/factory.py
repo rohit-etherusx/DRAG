@@ -74,6 +74,8 @@ def _build_configured_provider(config: EngineConfig) -> LLMProvider | None:
             model=config.llm_model,
             base_url=config.llm_base_url,
             max_tokens=config.llm_max_tokens,
+            timeout_seconds=config.llm_timeout_seconds,
+            max_retries=config.llm_max_retries,
         )
     _log.warning("Unknown LLM provider '%s'; using deterministic synthesis", config.llm_provider)
     return None

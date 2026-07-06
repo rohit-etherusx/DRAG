@@ -31,12 +31,17 @@ recorded in the state and the run continues.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from research_engine.collection.collector import RetrievalManager
+from research_engine.concurrency import parallel_map
 from research_engine.config import EngineConfig
 from research_engine.domain.models import (
+    Evidence,
     RawDocument,
     ResearchRequest,
     ResearchSession,
+    SearchCandidate,
     SearchTask,
     Task,
     TaskKind,
@@ -65,6 +70,22 @@ from research_engine.verification.equivalence import LLMEquivalenceJudge
 from research_engine.verification.verifier import ClaimVerifier
 
 _log = get_logger("orchestrator")
+
+
+@dataclass
+class _Fetched:
+    """One search task's pure acquisition result (no research-state writes).
+
+    Produced concurrently in the acquisition fan-out; consumed sequentially, in
+    task order, by the deterministic merge. ``error`` is set instead of raising
+    so one failing task never aborts the batch.
+    """
+
+    search_task: SearchTask
+    candidates: list[SearchCandidate] = field(default_factory=list)
+    accepted: int = 0
+    documents: list[RawDocument] = field(default_factory=list)
+    error: Exception | None = None
 
 
 class ResearchOrchestrator:
@@ -309,49 +330,110 @@ class ResearchOrchestrator:
     ) -> list[RawDocument]:
         """Execute one iteration's search tasks against the state.
 
-        Each task is isolated: search → candidate evaluation → download →
-        passage extraction → claim extraction, with any failure recorded on
-        the state (and the subquestion's collect task) without aborting the
-        iteration. Returns the documents acquired this iteration.
+        Concurrency with preserved determinism. The independent, network-bound
+        work — per-task search + candidate evaluation + download, then per-
+        document claim extraction — runs on a bounded thread pool; every write
+        to the single-source-of-truth research state happens on this thread, in
+        task order. Any per-task failure is recorded on the state (and the
+        subquestion's collect task) without aborting the iteration. Returns the
+        documents acquired this iteration.
+
+        Stages:
+          1. fan-out (parallel): search → evaluate → download, per task, pure;
+          2. merge (sequential, task order): record candidates/documents,
+             de-duplicate documents, extract passages (order-dependent, so it
+             stays sequential);
+          3. fan-out (parallel): claim extraction per document, pure;
+          4. merge (sequential, order-preserving): record extracted claims.
         """
-        acquired: list[RawDocument] = []
-        for search_task in search_tasks:
+        max_workers = self._config.max_workers
+        # A single visited-URL snapshot for the whole fan-out; cross-task
+        # duplicates are removed deterministically in the merge below.
+        visited = state.visited_urls
+
+        def fetch(search_task: SearchTask) -> _Fetched:
             collect_task = collect_tasks.get(search_task.subquestion_id)
-            if collect_task is not None:
-                collect_task.status = TaskStatus.IN_PROGRESS
             try:
                 candidates = retrieval.search(
                     search_task,
-                    state.visited_urls,
+                    visited,
                     collect_task.id if collect_task else "",
                 )
                 outcome = evaluator.evaluate(candidates, search_task.objective)
-                state.add_candidates(candidates)
-
                 documents = retrieval.download(outcome.accepted)
-                state.add_documents(documents)
-                acquired.extend(documents)
+                return _Fetched(
+                    search_task, candidates, len(outcome.accepted), documents
+                )
+            except Exception as exc:  # captured, not raised: isolate one bad task
+                return _Fetched(search_task, error=exc)
 
-                evidence, extracted = processor.process(
-                    documents, search_task.objective
-                )
-                state.add_evidence(evidence)
-                state.add_extracted_claims(extracted)
-                if collect_task is not None:
-                    collect_task.status = TaskStatus.COMPLETED
-                _log.info(
-                    "%s (iter %d): %d candidate(s), %d accepted, "
-                    "%d downloaded, %d passage(s), %d claim(s)",
-                    search_task.id, iteration, len(candidates),
-                    len(outcome.accepted), len(documents), len(evidence),
-                    len(extracted),
-                )
-            except Exception as exc:  # keep the session resilient to a bad source
+        results = parallel_map(fetch, search_tasks, max_workers)
+
+        # Merge (sequential, task order) — the only place state is mutated.
+        acquired: list[RawDocument] = []
+        pending: list[tuple[RawDocument, list[Evidence], _Fetched]] = []
+        seen_source_ids: set[str] = set(state.sources_by_id)
+        for fetched in results:
+            search_task = fetched.search_task
+            collect_task = collect_tasks.get(search_task.subquestion_id)
+            if collect_task is not None:
+                collect_task.status = TaskStatus.IN_PROGRESS
+            if fetched.error is not None:
                 state.record_search_failure(
-                    f"{search_task.id} ({search_task.query!r}): {exc}"
+                    f"{search_task.id} ({search_task.query!r}): {fetched.error}"
                 )
                 if collect_task is not None:
                     collect_task.status = TaskStatus.FAILED
-                    collect_task.error = str(exc)
-                _log.warning("Search task %s failed: %s", search_task.id, exc)
+                    collect_task.error = str(fetched.error)
+                _log.warning(
+                    "Search task %s failed: %s", search_task.id, fetched.error
+                )
+                continue
+            state.add_candidates(fetched.candidates)
+            # The fan-out shared one visited snapshot, so two tasks can accept
+            # the same URL; keep the first (task order) and drop later repeats.
+            fresh_docs: list[RawDocument] = []
+            for document in fetched.documents:
+                if document.source.id in seen_source_ids:
+                    continue
+                seen_source_ids.add(document.source.id)
+                fresh_docs.append(document)
+            state.add_documents(fresh_docs)
+            acquired.extend(fresh_docs)
+            passages = processor.extract_passages(fresh_docs, search_task.objective)
+            for document, evidence in passages:
+                state.add_evidence(evidence)
+                pending.append((document, evidence, fetched))
+            _log.info(
+                "%s (iter %d): %d candidate(s), %d accepted, %d downloaded, "
+                "%d passage(s)",
+                search_task.id, iteration, len(fetched.candidates),
+                fetched.accepted, len(fresh_docs),
+                sum(len(ev) for _d, ev in passages),
+            )
+
+        # Claim extraction (parallel) then merge (sequential, order-preserving).
+        extracted = parallel_map(
+            lambda item: processor.extract_claims(item[0], item[1]),
+            pending,
+            max_workers,
+        )
+        claim_count = 0
+        for claims in extracted:
+            state.add_extracted_claims(claims)
+            claim_count += len(claims)
+
+        # A collect task completes once its subquestion's tasks all succeeded.
+        for fetched in results:
+            collect_task = collect_tasks.get(fetched.search_task.subquestion_id)
+            if (
+                collect_task is not None
+                and fetched.error is None
+                and collect_task.status is TaskStatus.IN_PROGRESS
+            ):
+                collect_task.status = TaskStatus.COMPLETED
+        _log.info(
+            "Iteration %d acquisition: %d document(s), %d claim(s) extracted",
+            iteration, len(acquired), claim_count,
+        )
         return acquired

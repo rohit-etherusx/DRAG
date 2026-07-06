@@ -41,10 +41,14 @@ class OpenRouterProvider(LLMProvider):
         model: str = DEFAULT_LLM_MODEL,
         base_url: str = DEFAULT_LLM_BASE_URL,
         max_tokens: int = 1500,
+        timeout_seconds: float = 45.0,
+        max_retries: int = 2,
     ) -> None:
         self.model = model
         self.base_url = base_url
         self.max_tokens = max_tokens
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
         self._client = None
 
     @property
@@ -58,6 +62,13 @@ class OpenRouterProvider(LLMProvider):
             self._client = OpenAI(
                 base_url=self.base_url,
                 api_key=os.environ.get(API_KEY_ENV),
+                # Bound each request so a stalled provider fails fast to the
+                # deterministic fallback instead of hanging on the SDK's 600 s
+                # default; retries are bounded so a hard failure can't multiply
+                # that wait. Critical once acquisition runs concurrently — an
+                # unbounded request would pin a worker thread for minutes.
+                timeout=self.timeout_seconds,
+                max_retries=self.max_retries,
             )
         return self._client
 

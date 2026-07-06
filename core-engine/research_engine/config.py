@@ -142,6 +142,20 @@ class EngineConfig:
     #: per verification pass (0 disables the judge even when an LLM is on).
     max_equivalence_checks: int = 40
 
+    # --- v0.6: performance / concurrency -----------------------------------
+    #: Maximum concurrent worker threads for I/O-bound acquisition (per-
+    #: subquestion search + download, then per-document claim extraction).
+    #: The work is I/O-bound so threads parallelize despite the GIL. Set to 1
+    #: to force fully sequential execution. Determinism is preserved regardless:
+    #: results are merged into the research state single-threaded, in task order.
+    max_workers: int = 6
+    #: Per-request timeout (seconds) for LLM calls. Bounds a stalled provider
+    #: request so it fails fast to the deterministic fallback instead of hanging
+    #: on the SDK's 600 s default (the root cause of observed 10-minute stalls).
+    llm_timeout_seconds: float = 45.0
+    #: Automatic retries the LLM client makes on a failed/timed-out request.
+    llm_max_retries: int = 2
+
     #: Logging verbosity.
     log_level: str = "INFO"
 
@@ -205,6 +219,11 @@ class EngineConfig:
             max_equivalence_checks=_env_int(
                 "RE_MAX_EQUIVALENCE_CHECKS", cls.max_equivalence_checks
             ),
+            max_workers=_env_int("RE_MAX_WORKERS", cls.max_workers),
+            llm_timeout_seconds=_env_float(
+                "RE_LLM_TIMEOUT_SECONDS", cls.llm_timeout_seconds
+            ),
+            llm_max_retries=_env_int("RE_LLM_MAX_RETRIES", cls.llm_max_retries),
             log_level=os.environ.get("RE_LOG_LEVEL", cls.log_level),
         )
         for key, value in overrides.items():
