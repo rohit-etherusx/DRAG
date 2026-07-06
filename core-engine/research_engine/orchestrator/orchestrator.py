@@ -51,6 +51,20 @@ from research_engine.knowledge.builder import KnowledgeBuilder
 from research_engine.logging_setup import get_logger
 from research_engine.planner.planner import ResearchPlanner
 from research_engine.processing.extraction import build_extractor
+from research_engine.progress import (
+    AnswerReady,
+    ExtractionDone,
+    IterationDone,
+    IterationStarted,
+    PlanReady,
+    ProgressReporter,
+    ReportReady,
+    SearchTaskDone,
+    SessionStarted,
+    Stopping,
+    VerificationDone,
+    emit,
+)
 from research_engine.processing.normalizer import ClaimNormalizer
 from research_engine.processing.processor import EvidenceProcessor
 from research_engine.providers.base import LLMProvider, SearchProvider
@@ -104,7 +118,17 @@ class ResearchOrchestrator:
         self._storage = storage
         self._report_generator = ReportGenerator()
 
-    def run(self, request: ResearchRequest) -> ResearchSession:
+    def run(
+        self,
+        request: ResearchRequest,
+        progress: ProgressReporter | None = None,
+    ) -> ResearchSession:
+        """Run a full research session, optionally reporting live progress.
+
+        ``progress`` is an observe-only reporter (see ``progress.py``): it is
+        invoked from this thread at each checkpoint and cannot affect results.
+        Omitting it is the default, zero-overhead path.
+        """
         config = self._config
         llm = self._llm if config.llm_enabled else None
 
@@ -127,6 +151,12 @@ class ResearchOrchestrator:
             "Plan (%s): %d subquestion(s) for objective: %s",
             plan.planner, len(plan.subquestions), plan.objective,
         )
+        emit(progress, SessionStarted(request.topic, state.session_id))
+        emit(progress, PlanReady(
+            plan.objective,
+            [(sq.id, sq.question) for sq in plan.subquestions],
+            plan.planner,
+        ))
 
         # 2. Assemble the pipeline around the state.
         retrieval = RetrievalManager(self._search, config.max_candidates_per_query)
@@ -185,19 +215,20 @@ class ResearchOrchestrator:
                 )
                 _log.info("Stopping before iteration %d: %s",
                           iteration, state.stop_reason)
+                emit(progress, Stopping(iteration, state.stop_reason))
                 break
+            source = "initial plan" if iteration == 1 else "knowledge gaps"
             _log.info(
                 "Iteration %d: %d search task(s) (%s)",
-                iteration,
-                len(search_tasks),
-                "initial plan" if iteration == 1 else "knowledge gaps",
+                iteration, len(search_tasks), source,
             )
+            emit(progress, IterationStarted(iteration, len(search_tasks), source))
 
             prior_extracted = list(state.extracted_claims)
             claims_before = len(state.claims)
             new_documents = self._acquire(
                 state, search_tasks, retrieval, evaluator, processor,
-                collect_tasks, iteration,
+                collect_tasks, iteration, progress,
             )
 
             # Knowledge update over the full accumulated evidence.
@@ -212,6 +243,10 @@ class ResearchOrchestrator:
                     "Verification: %d claim(s), %d corroborated, %d unsupported",
                     len(claims), corroborated, verification.unsupported_claims,
                 )
+                emit(progress, VerificationDone(
+                    iteration, len(claims), corroborated,
+                    verification.unsupported_claims,
+                ))
             else:
                 contradictions, corroborated = [], 0
             graph = builder.build(claims, state.evidence)
@@ -269,12 +304,17 @@ class ResearchOrchestrator:
                 iteration, record.novelty * 100, record.knowledge_gain * 100,
                 record.confidence * 100, len(new_gaps), record.gaps_open,
             )
+            emit(progress, IterationDone(
+                iteration, record.novelty, record.knowledge_gain,
+                record.confidence, len(new_gaps), record.gaps_open,
+            ))
 
             decision = stopping.decide(state)
             if decision.stop:
                 state.stop_reason = decision.reason
                 _log.info("Stopping after iteration %d: %s",
                           iteration, decision.reason)
+                emit(progress, Stopping(iteration, decision.reason))
                 break
             _log.info("Continuing research: %s", decision.reason)
 
@@ -300,6 +340,7 @@ class ResearchOrchestrator:
             session.overall_confidence = result.confidence.score
             session.answer = answer
             session.direct_answer = answer.text
+            emit(progress, AnswerReady(answer.text, result.confidence.score))
         else:  # the loop never ran a full pass (no search tasks at all)
             summary = (
                 f"Research on '{plan.question}' produced no executable "
@@ -316,6 +357,10 @@ class ResearchOrchestrator:
         report_path = self._storage.save_report(session)
         self._storage.save_session(session)
         _log.info("Report written to %s", report_path)
+        emit(progress, ReportReady(
+            session.report.markdown if session.report else "",
+            report_path,
+        ))
         return session
 
     def _acquire(
@@ -327,6 +372,7 @@ class ResearchOrchestrator:
         processor: EvidenceProcessor,
         collect_tasks: dict[str, Task],
         iteration: int,
+        progress: ProgressReporter | None = None,
     ) -> list[RawDocument]:
         """Execute one iteration's search tasks against the state.
 
@@ -388,6 +434,10 @@ class ResearchOrchestrator:
                 _log.warning(
                     "Search task %s failed: %s", search_task.id, fetched.error
                 )
+                emit(progress, SearchTaskDone(
+                    iteration, search_task.id, search_task.query,
+                    search_task.subquestion_id, failed=True,
+                ))
                 continue
             state.add_candidates(fetched.candidates)
             # The fan-out shared one visited snapshot, so two tasks can accept
@@ -404,13 +454,18 @@ class ResearchOrchestrator:
             for document, evidence in passages:
                 state.add_evidence(evidence)
                 pending.append((document, evidence, fetched))
+            passage_count = sum(len(ev) for _d, ev in passages)
             _log.info(
                 "%s (iter %d): %d candidate(s), %d accepted, %d downloaded, "
                 "%d passage(s)",
                 search_task.id, iteration, len(fetched.candidates),
-                fetched.accepted, len(fresh_docs),
-                sum(len(ev) for _d, ev in passages),
+                fetched.accepted, len(fresh_docs), passage_count,
             )
+            emit(progress, SearchTaskDone(
+                iteration, search_task.id, search_task.query,
+                search_task.subquestion_id, len(fetched.candidates),
+                fetched.accepted, len(fresh_docs), passage_count,
+            ))
 
         # Claim extraction (parallel) then merge (sequential, order-preserving).
         extracted = parallel_map(
@@ -436,4 +491,5 @@ class ResearchOrchestrator:
             "Iteration %d acquisition: %d document(s), %d claim(s) extracted",
             iteration, len(acquired), claim_count,
         )
+        emit(progress, ExtractionDone(iteration, len(acquired), claim_count))
         return acquired
