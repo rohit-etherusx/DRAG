@@ -76,8 +76,14 @@ def run(argv: list[str] | None = None) -> int:
     controller = TuiController(topic, config.max_iterations)
     session: ResearchSession | None = None
     try:
-        with Live(controller, console=console, refresh_per_second=12,
-                  transient=True):
+        # screen=True renders into the terminal's alternate buffer (like vim /
+        # less): Rich owns the whole screen and does flicker-free diff updates,
+        # instead of repainting a full-height Layout in place on every refresh.
+        # vertical_overflow="crop" keeps a tall region (e.g. the report panel)
+        # clipped to its box rather than reflowing the frame. On exit the buffer
+        # is restored and the full report is printed to the normal screen below.
+        with Live(controller, console=console, refresh_per_second=8,
+                  screen=True, vertical_overflow="crop"):
             session = run_research(topic, config, progress=controller)
     except KeyboardInterrupt:
         console.print("\n[yellow]interrupted[/] — research stopped early.")
