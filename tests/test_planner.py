@@ -26,7 +26,7 @@ class _StubLLM(LLMProvider):
     def available(self):
         return True
 
-    def generate(self, prompt, system=None):
+    def generate(self, prompt, system=None, *, json_object=False):
         self.calls += 1
         if not self._responses:
             return None

@@ -61,11 +61,21 @@ class OpenRouterProvider(LLMProvider):
             )
         return self._client
 
-    def generate(self, prompt: str, system: str | None = None) -> str | None:
+    def generate(
+        self, prompt: str, system: str | None = None, *, json_object: bool = False
+    ) -> str | None:
         if not self.available:
             return None
         try:
             client = self._get_client()
+            # Structured-output mode makes JSON-returning calls (extraction, the
+            # equivalence judge, the planner) far more reliable on models that
+            # otherwise wrap JSON in prose. Providers/models that do not support
+            # it either ignore the field or error — in which case the outer
+            # except returns None and the caller falls back deterministically.
+            extra = (
+                {"response_format": {"type": "json_object"}} if json_object else {}
+            )
             response = client.chat.completions.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
@@ -77,6 +87,7 @@ class OpenRouterProvider(LLMProvider):
                     },
                     {"role": "user", "content": prompt},
                 ],
+                **extra,
             )
             text = (response.choices[0].message.content or "").strip()
             return text or None

@@ -55,10 +55,19 @@ class LLMProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def generate(self, prompt: str, system: str | None = None) -> str | None:
+    def generate(
+        self, prompt: str, system: str | None = None, *, json_object: bool = False
+    ) -> str | None:
         """Return generated text, or ``None`` if generation is unavailable.
 
         Returning ``None`` (rather than raising) lets callers fall back to a
         deterministic path cleanly.
+
+        ``json_object`` asks the backend to constrain output to a single JSON
+        object (via the provider's structured-output mode where supported).
+        Callers that parse the response as JSON — claim extraction, the
+        equivalence judge, the LLM planner — pass ``True``; prose callers leave
+        it ``False``. Implementations that cannot honour it must ignore it,
+        never fail.
         """
         raise NotImplementedError

@@ -140,7 +140,9 @@ class NullLLMProvider(LLMProvider):
     def available(self) -> bool:
         return False
 
-    def generate(self, prompt: str, system: str | None = None) -> str | None:
+    def generate(
+        self, prompt: str, system: str | None = None, *, json_object: bool = False
+    ) -> str | None:
         return None
 
 

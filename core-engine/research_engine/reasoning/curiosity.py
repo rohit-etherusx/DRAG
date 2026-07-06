@@ -82,6 +82,13 @@ class CuriosityEngine:
         gaps.extend(_entity_gaps(claims, entities, plan))
         gaps.extend(_contradiction_gaps(contradictions, claims))
         gaps.extend(_primary_source_gaps(claims, sources))
+        # Anchor every gap query to the research subject. Gap queries are built
+        # from subquestion/claim keywords ("critical reception", "what is
+        # setting") that, unanchored, retrieve confident off-topic results (a
+        # "hollow-knight" run pulling Harry-Potter and impressionism pages). The
+        # subject prefix keeps gap-driven search on the research topic.
+        for gap in gaps:
+            gap.suggested_query = _anchor(gap.suggested_query, plan.subject)
         return gaps
 
 
@@ -238,6 +245,20 @@ def _gap(
         entity=entity,
         priority=_PRIORITY[kind],
     )
+
+
+def _anchor(query: str, subject: str) -> str:
+    """Prefix ``query`` with the research ``subject`` unless already present.
+
+    Keeps gap-driven searches on-topic. The presence check is a case-insensitive
+    substring test so a query the builder already anchored (e.g. "X role in
+    {subject}") is not prefixed twice. Empty subject leaves the query unchanged.
+    """
+    query = (query or "").strip()
+    subject = (subject or "").strip()
+    if not subject or subject.lower() in query.lower():
+        return query
+    return f"{subject} {query}".strip() if query else subject
 
 
 def _connected_entities(claims: list[Claim]) -> set[str]:

@@ -62,6 +62,9 @@ class CandidateEvaluator:
         self._plan_terms = _terms(
             [plan.subject, plan.question] + list(plan.expected_entities)
         )
+        #: The topic anchor: a candidate that shares none of the subject's terms
+        #: is off-topic no matter how many generic subquestion terms it matches.
+        self._subject_terms = _terms([plan.subject])
         self._exclusions = [term.lower() for term in plan.exclusion_criteria if term]
 
     def evaluate(
@@ -125,6 +128,12 @@ class CandidateEvaluator:
                 f"relevance {candidate.relevance_score:.2f} below threshold "
                 f"{self._relevance_threshold:.2f}"
             )
+        # Topic anchor: a candidate can clear the (low) relevance bar on generic
+        # subquestion terms alone while sharing no subject term — that is the
+        # off-topic drift seen on gap-driven searches. Require at least one
+        # subject term when the plan has any. Fails open on a term-less subject.
+        if self._subject_terms and not (self._subject_terms & _tokens(candidate)):
+            return "off-topic: shares no subject term"
         if candidate.authority < self._min_authority:
             return (
                 f"authority {candidate.authority:.2f} below minimum "
@@ -138,6 +147,13 @@ def _terms(texts: list[str]) -> set[str]:
     for text in texts:
         terms.update(k.lower() for k in keywords(text or ""))
     return {t for t in terms if len(t) >= 3}
+
+
+def _tokens(candidate: SearchCandidate) -> set[str]:
+    """All lowercased word tokens in a candidate's title and snippet."""
+    return set(
+        _TOKEN_RE.findall(f"{candidate.title} {candidate.snippet}".lower())
+    )
 
 
 def _relevance(candidate: SearchCandidate, terms: set[str]) -> float:
