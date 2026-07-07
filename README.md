@@ -397,7 +397,8 @@ Endpoints:
 | Method & path | What it does |
 |---------------|--------------|
 | `GET /health` | Liveness + version. |
-| `POST /research` | Runs a full session, returns the serialized session as JSON. |
+| `POST /research` | Runs a full session, returns the serialized session as JSON (blocking). |
+| `POST /research/stream` | Runs a session and **streams progress** as Server-Sent Events, ending with the full session. Powers the web UI. |
 | `GET /docs` | Auto-generated Swagger UI (courtesy of FastAPI). |
 
 ```bash
@@ -416,6 +417,37 @@ worker thread), because a real run is blocking and can take a minute or two.
 
 It reuses the exact same engine as the CLI (via `service.run_research`), so
 whatever the CLI produces, the API produces — just JSON-shaped.
+
+The streaming endpoint (`POST /research/stream`) uses the engine's progress
+observer seam: a background thread runs the blocking engine while its `progress`
+reporter forwards each typed event (`PlanReady`, `IterationDone`, `AnswerReady`,
+…) onto the event loop, which emits them as SSE frames — then a terminal
+`SessionComplete` frame carries the full session (or an in-band `Error` frame).
+No research logic lives in the API; it's a thin adapter (ARCHITECTURE.md, Layer 1).
+
+## 🖥️ Web UI (optional)
+
+A polished single-page app (`ui/`, React + Vite + Tailwind) drives the engine
+through the streaming API: type a question, watch the plan, iterations, and
+confidence build **live**, then explore the grounded result — the rendered
+report plus tabs for findings, verified claims, sources (with authority), the
+confidence breakdown, and any contradictions. Dark/light, responsive, no
+research logic in the client (it only calls the API).
+
+```bash
+# 1. Backend
+uv run research-engine-api           # http://127.0.0.1:8000
+
+# 2a. Development (hot reload; proxies API calls to :8000)
+cd ui && npm install && npm run dev  # http://localhost:5173
+
+# 2b. Production (single command, no separate server)
+cd ui && npm run build               # emits ui/dist
+uv run research-engine-api           # now also serves the built UI at /
+```
+
+When `ui/dist/` exists, the API serves it at `/` — so a built app is a
+one-command launch. Point the API elsewhere in dev with `VITE_API_TARGET`.
 
 ## 🧪 Running the tests
 

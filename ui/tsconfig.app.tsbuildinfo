@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/components/Results.tsx","./src/components/RunProgress.tsx","./src/components/SearchForm.tsx","./src/components/explorer/Explorer.tsx","./src/components/report/ReportView.tsx","./src/components/ui/primitives.tsx","./src/lib/api.ts","./src/lib/format.ts","./src/lib/runModel.ts","./src/types/domain.ts"],"version":"5.9.3"}

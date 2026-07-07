@@ -43,6 +43,60 @@ class ApiTests(unittest.TestCase):
         self.assertIn("markdown", data["report"])
         self.assertIn("# Research Report: Renewable Energy", data["report"]["markdown"])
 
+    def test_research_stream_emits_events_then_session(self):
+        # The SSE stream should carry progress frames and end with the full
+        # session. Offline + no_llm keeps it deterministic and network-free.
+        import json
+
+        with self.client.stream(
+            "POST",
+            "/research/stream",
+            json={
+                "topic": "Renewable Energy",
+                "max_subtopics": 2,
+                "offline": True,
+                "no_llm": True,
+            },
+        ) as resp:
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("text/event-stream", resp.headers["content-type"])
+            payloads = []
+            for line in resp.iter_lines():
+                if line.startswith("data: "):
+                    payloads.append(json.loads(line[len("data: "):]))
+
+        types = [p["type"] for p in payloads]
+        self.assertIn("SessionStarted", types)
+        self.assertIn("PlanReady", types)
+        self.assertIn("SessionComplete", types)
+        # SessionComplete carries the full serialized session for the UI.
+        final = next(p for p in payloads if p["type"] == "SessionComplete")
+        session = final["session"]
+        self.assertEqual(session["status"], "completed")
+        self.assertIn("markdown", session["report"])
+        # The terminal Done frame closes the stream.
+        self.assertEqual(types[-1], "Done")
+
+    def test_stream_error_frame_on_bad_request(self):
+        # A whitespace-only topic passes Pydantic (min_length on the raw string)
+        # but the engine rejects it — surfaced as an in-band Error frame, not a
+        # broken stream.
+        import json
+
+        with self.client.stream(
+            "POST", "/research/stream", json={"topic": "   ", "offline": True, "no_llm": True}
+        ) as resp:
+            self.assertEqual(resp.status_code, 200)
+            payloads = [
+                json.loads(line[len("data: "):])
+                for line in resp.iter_lines()
+                if line.startswith("data: ")
+            ]
+        types = [p["type"] for p in payloads]
+        self.assertIn("Error", types)
+        err = next(p for p in payloads if p["type"] == "Error")
+        self.assertEqual(err["status"], 400)
+
     def test_empty_topic_is_rejected(self):
         # Pydantic validation (min_length=1) -> 422 unprocessable entity.
         resp = self.client.post("/research", json={"topic": ""})
