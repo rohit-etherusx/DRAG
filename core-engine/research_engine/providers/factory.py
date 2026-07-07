@@ -14,6 +14,7 @@ from research_engine.logging_setup import get_logger
 from research_engine.providers.base import LLMProvider, SearchProvider
 from research_engine.providers.offline import NullLLMProvider, OfflineSearchProvider
 from research_engine.providers.openrouter_provider import OpenRouterProvider
+from research_engine.providers.sources import _http
 from research_engine.providers.sources.arxiv import ArxivSearchProvider
 from research_engine.providers.sources.composite import CompositeSearchProvider
 from research_engine.providers.sources.duckduckgo import DuckDuckGoSearchProvider
@@ -32,6 +33,13 @@ def build_search_provider(config: EngineConfig) -> SearchProvider:
     if config.search_provider == "offline":
         _log.info("Using offline deterministic search provider")
         return OfflineSearchProvider()
+    # Configure the shared HTTP layer's retry budget and per-host concurrency cap
+    # before any request runs, so concurrent acquisition (max_workers > 1) stays
+    # rate-limit-safe. Only the web path touches the network; offline skips this.
+    _http.configure_http(
+        max_retries=config.http_max_retries,
+        max_per_host=config.http_max_concurrency_per_host,
+    )
     provider = CompositeSearchProvider(
         [
             WikipediaSearchProvider(),

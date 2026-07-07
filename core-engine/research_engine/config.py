@@ -155,6 +155,15 @@ class EngineConfig:
     llm_timeout_seconds: float = 45.0
     #: Automatic retries the LLM client makes on a failed/timed-out request.
     llm_max_retries: int = 2
+    #: Retries per source HTTP request on a retryable failure (429/5xx or a
+    #: transient network error), with exponential backoff honouring ``Retry-After``.
+    #: Makes concurrent acquisition resilient to rate-limiting instead of dropping
+    #: a document on the first 429. Set 0 to disable HTTP retries.
+    http_max_retries: int = 3
+    #: Cap on simultaneous in-flight requests to any single host, independent of
+    #: ``max_workers``. This is what lets ``max_workers`` be raised without
+    #: provoking more host-side rate-limiting (a Wikipedia 429 under load).
+    http_max_concurrency_per_host: int = 4
 
     #: Logging verbosity.
     log_level: str = "INFO"
@@ -224,6 +233,11 @@ class EngineConfig:
                 "RE_LLM_TIMEOUT_SECONDS", cls.llm_timeout_seconds
             ),
             llm_max_retries=_env_int("RE_LLM_MAX_RETRIES", cls.llm_max_retries),
+            http_max_retries=_env_int("RE_HTTP_MAX_RETRIES", cls.http_max_retries),
+            http_max_concurrency_per_host=_env_int(
+                "RE_HTTP_MAX_CONCURRENCY_PER_HOST",
+                cls.http_max_concurrency_per_host,
+            ),
             log_level=os.environ.get("RE_LOG_LEVEL", cls.log_level),
         )
         for key, value in overrides.items():
