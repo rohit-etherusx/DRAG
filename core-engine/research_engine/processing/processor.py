@@ -43,16 +43,47 @@ class EvidenceProcessor:
         Passage de-duplication is global across every document processed by
         this instance: a passage already seen (case/whitespace-insensitive) is
         skipped so repeated text doesn't inflate corroboration downstream.
+
+        This is the sequential convenience path (passage then claim extraction
+        per document). The orchestrator instead drives :meth:`extract_passages`
+        and :meth:`extract_claims` separately so the slow, network-bound claim
+        extraction can run concurrently while passage de-duplication stays
+        deterministic; both paths produce identical output.
         """
         all_evidence: list[Evidence] = []
         all_claims: list[ExtractedClaim] = []
+        for document, evidence in self.extract_passages(documents, subquestion_text):
+            all_evidence.extend(evidence)
+            all_claims.extend(self.extract_claims(document, evidence))
+        return all_evidence, all_claims
+
+    def extract_passages(
+        self, documents: list[RawDocument], subquestion_text: str
+    ) -> list[tuple[RawDocument, list[Evidence]]]:
+        """Passage-extract ``documents``, pairing each with its evidence.
+
+        Stateful and deterministic: id assignment and the global passage
+        de-duplication depend on call order, so this must run sequentially (the
+        orchestrator calls it once per iteration, in task order). Documents with
+        no surviving evidence are dropped from the result.
+        """
+        paired: list[tuple[RawDocument, list[Evidence]]] = []
         for document in documents:
             evidence = self._extract_evidence(document, subquestion_text)
-            if not evidence:
-                continue
-            all_evidence.extend(evidence)
-            all_claims.extend(self._extractor.extract(document, evidence))
-        return all_evidence, all_claims
+            if evidence:
+                paired.append((document, evidence))
+        return paired
+
+    def extract_claims(
+        self, document: RawDocument, evidence: list[Evidence]
+    ) -> list[ExtractedClaim]:
+        """Extract typed claims from one document's evidence passages.
+
+        Pure with respect to this processor's state — it only delegates to the
+        configured extractor — so it is safe to run concurrently across
+        documents once :meth:`extract_passages` has assigned evidence.
+        """
+        return self._extractor.extract(document, evidence)
 
     def _extract_evidence(
         self, document: RawDocument, subquestion_text: str

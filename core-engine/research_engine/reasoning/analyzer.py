@@ -33,6 +33,7 @@ from research_engine.domain.models import (
     SubQuestion,
     VerificationStatus,
 )
+from research_engine.concurrency import parallel_map
 from research_engine.knowledge.graph import EvidenceGraph
 from research_engine.logging_setup import get_logger
 from research_engine.providers.base import LLMProvider
@@ -69,9 +70,15 @@ class ReasoningResult:
 class ReasoningEngine:
     """Derives conclusions from verified claims and the evidence graph."""
 
-    def __init__(self, llm: LLMProvider | None = None, attempts: int = 2) -> None:
+    def __init__(
+        self,
+        llm: LLMProvider | None = None,
+        attempts: int = 2,
+        max_workers: int = 1,
+    ) -> None:
         self._llm = llm
         self._attempts = max(1, attempts)
+        self._max_workers = max(1, max_workers)
         self._confidence = ConfidenceModel()
 
     def analyze(
@@ -96,8 +103,13 @@ class ReasoningEngine:
             )
 
         # 2. Findings per subquestion; gaps feed the research loop.
+        #    Classification (missing/weak) is deterministic and sequential;
+        #    the finding *statements* each carry an independent LLM call, so
+        #    they fan out across the pool. ``parallel_map`` preserves plan
+        #    order, so the findings list is identical to the sequential path.
         assertive = [c for c in claims if c.claim_type is not ClaimType.OPEN_QUESTION]
         by_subquestion = _group_by_subquestion(assertive)
+        to_build: list[tuple[SubQuestion, list[Claim]]] = []
         for subquestion in plan.subquestions:
             supporting = by_subquestion.get(subquestion.id, [])
             if not supporting:
@@ -112,9 +124,14 @@ class ReasoningEngine:
                     f"{subquestion.question}"
                 )
                 result.weak_subquestion_ids.append(subquestion.id)
-            result.findings.append(
-                self._build_finding(subquestion, supporting, sources, evidence_by_id)
-            )
+            to_build.append((subquestion, supporting))
+        result.findings = parallel_map(
+            lambda item: self._build_finding(
+                item[0], item[1], sources, evidence_by_id
+            ),
+            to_build,
+            self._max_workers,
+        )
 
         # 3. Patterns, hypotheses, open questions, suggestions.
         result.patterns = _patterns(graph, plan)
@@ -128,6 +145,27 @@ class ReasoningEngine:
         )
         result.confidence = self._confidence.report(overall_inputs)
         return result
+
+    def assess_confidence(
+        self,
+        *,
+        plan: ResearchPlan,
+        claims: list[Claim],
+        contradictions: list[Contradiction],
+        sources: dict[str, Source],
+        evidence: list[Evidence],
+    ) -> ConfidenceReport:
+        """Deterministic overall confidence for the current knowledge model.
+
+        The cheap, LLM-free subset of :meth:`analyze` the research loop needs
+        every iteration for its stopping decision. The expensive narrative
+        (LLM-phrased findings and hypotheses) is generated once, at the end, via
+        :meth:`analyze` — regenerating it on every iteration only to discard all
+        but the last was the loop's dominant, unparallelised cost.
+        """
+        return self._confidence.report(
+            self._overall_inputs(plan, claims, contradictions, sources, evidence)
+        )
 
     # -- confidence inputs --------------------------------------------------
 

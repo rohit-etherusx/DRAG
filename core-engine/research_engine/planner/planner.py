@@ -322,7 +322,9 @@ class ResearchPlanner:
         )
         for _ in range(self._attempts):
             raw = self._llm.generate(
-                prompt, system="You produce structured research plans as strict JSON."
+                prompt,
+                system="You produce structured research plans as strict JSON.",
+                json_object=True,
             )
             plan = _parse_plan(raw, question, limit)
             if plan is not None:

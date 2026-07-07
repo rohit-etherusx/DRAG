@@ -177,6 +177,7 @@ class LLMClaimExtractor(ClaimExtractor):
             raw = self._llm.generate(
                 prompt,
                 system="You extract typed, source-grounded claims as strict JSON.",
+                json_object=True,
             )
             claims = _parse_claims(raw, evidence, self._max_claims)
             if claims:

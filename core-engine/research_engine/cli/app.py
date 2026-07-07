@@ -1,8 +1,9 @@
-"""Command-line interface.
+"""Plain command-line interface.
 
 Wires configuration and providers into a :class:`ResearchOrchestrator`, runs a
 research session for the supplied topic, and prints a short summary. This is the
-single interactive surface for v0.1 (no TUI/API, per the objective's scope).
+non-interactive surface; the animated dashboard lives in ``cli.tui`` and shares
+this module's argument parser and config wiring.
 """
 from __future__ import annotations
 
@@ -17,9 +18,9 @@ from research_engine.service import run_research
 _log = get_logger("cli")
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
+def build_arg_parser(prog: str = "research-engine") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="research-engine",
+        prog=prog,
         description="Autonomous, domain-agnostic, claim-centric research engine.",
     )
     parser.add_argument(
@@ -60,12 +61,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(argv: list[str] | None = None) -> ResearchSession:
-    """Parse arguments, execute a research session, and return it."""
-    args = build_arg_parser().parse_args(argv)
-    topic = " ".join(args.topic).strip()
-
-    config = EngineConfig.from_env(
+def config_from_args(args: argparse.Namespace) -> EngineConfig:
+    """Build an :class:`EngineConfig` from parsed CLI arguments."""
+    return EngineConfig.from_env(
         output_dir=args.output_dir,
         sessions_dir=args.sessions_dir,
         max_subtopics=args.max_subtopics,
@@ -76,6 +74,13 @@ def run(argv: list[str] | None = None) -> ResearchSession:
         search_provider=("offline" if args.offline else None),
         log_level=("DEBUG" if args.verbose else None),
     )
+
+
+def run(argv: list[str] | None = None) -> ResearchSession:
+    """Parse arguments, execute a research session, and return it."""
+    args = build_arg_parser().parse_args(argv)
+    topic = " ".join(args.topic).strip()
+    config = config_from_args(args)
     configure_logging(config.log_level)
     return run_research(topic, config)
 

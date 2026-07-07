@@ -72,6 +72,7 @@ class LLMEquivalenceJudge(ClaimEquivalenceJudge):
                     "You answer as strict JSON and never merge claims that "
                     "merely share a topic."
                 ),
+                json_object=True,
             )
             verdicts = _parse_verdicts(raw, len(pairs))
             if verdicts is not None:

@@ -69,7 +69,7 @@ class _StubLLM(LLMProvider):
     def available(self):
         return True
 
-    def generate(self, prompt, system=None):
+    def generate(self, prompt, system=None, *, json_object=False):
         self.calls += 1
         return self._responses.pop(0) if self._responses else None
 

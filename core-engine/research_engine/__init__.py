@@ -25,4 +25,4 @@ source) is preserved end to end.
 * :mod:`research_engine.providers` — pluggable two-phase search + LLM providers.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

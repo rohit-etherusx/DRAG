@@ -1,6 +1,6 @@
 [project]
 name = "research-engine"
-version = "0.5.0"
+version = "0.6.0"
 description = "Domain-agnostic autonomous research engine"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,10 +24,17 @@ api = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
 ]
+# Animated terminal dashboard. Optional so the core install stays lean and the
+# engine never imports a rendering library:
+#   uv sync --extra tui    (or: pip install "research-engine[tui]")
+tui = [
+    "rich>=13.0",
+]
 dev = []
 
 [project.scripts]
 research-engine = "research_engine.cli:main"
+research-engine-tui = "research_engine.cli.tui:main"
 research-engine-api = "research_engine.api:serve"
 
 [build-system]
