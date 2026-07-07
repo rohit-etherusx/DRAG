@@ -23,14 +23,21 @@ leave a paper trail. Every statement in the report traces back through
 finding → claim → evidence passage → document → source. It's the difference
 between "trust me bro" and "here's my citation [S1]".
 
-**Status:** **v0.5 — Autonomous Research Agent.** The engine no longer runs a
-pipeline and calls it a day; it runs a *learning loop*. It keeps a single
-research state, notices what it doesn't know (missing definitions, single-source
-claims, contradictions), turns those gaps into new targeted searches, measures
-how much every iteration actually taught it, and stops when it's confident,
-out of gaps, or demonstrably no longer learning — with the reason on record.
-The answer is the product; the report is a rendering of the knowledge model.
-(The character-building journey here is in [The Backstory](#-the-backstory).)
+**Status:** **v0.6 — Autonomous Research Agent, now with a day job and a
+gym membership.** The engine runs a *learning loop*: it keeps a single research
+state, notices what it doesn't know (missing definitions, single-source claims,
+contradictions), turns those gaps into new targeted searches, measures how much
+every iteration actually taught it, and stops when it's confident, out of gaps,
+or demonstrably no longer learning — with the reason on record. v0.6 taught it
+to **stop hanging for ten minutes on a stalled request**, to do its network and
+LLM work **in parallel** (without sacrificing byte-for-byte determinism — the
+threads are pure, the merge is single-file), and to **back off politely** when a
+source starts rate-limiting it. And because staring at a silent terminal for
+eleven minutes is nobody's idea of a good time, it now ships with **two faces**:
+a live animated **terminal dashboard** and a **web app** that streams the whole
+investigation to your browser as it happens. The answer is the product; the
+report is a rendering of the knowledge model; everything else is presentation.
+(The full character-building journey is in [The Backstory](#-the-backstory).)
 
 ---
 
@@ -62,24 +69,6 @@ pipeline — deterministically:
 ```bash
 uv run research-engine "Quantum Computing" --offline --no-llm   # zero cost, zero network
 ```
-
-### 🖥️ Watch it think — the live terminal dashboard
-
-Prefer to *see* the research happen? There's an animated TUI. It shows progress
-bars and per-subquestion status filling in, knowledge counts updating in real
-time (candidates → documents → claims → corroborated), a live confidence gauge,
-and the full report rendered when it finishes.
-
-```bash
-uv sync --extra tui                       # adds Rich (the one TUI dependency)
-uv run research-engine-tui "Quantum Computing"
-```
-
-It takes the **same options** as `research-engine` (`--offline`, `--no-llm`,
-`--max-iterations`, …). Piping or redirecting output (non-interactive) falls
-back to the plain CLI automatically, so it stays script- and CI-friendly. The
-engine core never imports Rich — the dashboard is a pure Layer-1 wrapper over
-the engine's progress-event seam, so it can't affect what the engine produces.
 
 **No uv? No problem.** There's a zero-install escape hatch that degrades
 gracefully if the optional packages are missing:
@@ -283,7 +272,7 @@ core-engine/research_engine/
 ├── storage/storage.py                  report + session snapshot
 └── providers/                          base interfaces · openrouter · offline ·
     └── sources/                        wikipedia · arxiv · duckduckgo · composite
-tests/                                  168 network-free unittest tests
+tests/                                  201 network-free unittest tests
 main.py                                 zero-install shim (python3 main.py "topic")
 ```
 
@@ -356,6 +345,16 @@ no longer learning" thresholds), `RE_MAX_SEARCH_TASKS_PER_ITERATION`, and
 `RE_MAX_EQUIVALENCE_CHECKS` (borderline claim pairs the LLM judge reviews per
 verification pass; `0` disables the judge).
 
+The v0.6 performance knobs join the party too: **`RE_MAX_WORKERS`** (thread-pool
+size for parallel acquisition/extraction/reasoning; default 6, set `1` to force
+the fully sequential path), **`RE_LLM_TIMEOUT_SECONDS`** and
+**`RE_LLM_MAX_RETRIES`** (bound a stalled LLM request so it fails fast instead of
+hanging for ten minutes), and **`RE_HTTP_MAX_RETRIES`** /
+**`RE_HTTP_MAX_CONCURRENCY_PER_HOST`** (retry/backoff budget and the per-host cap
+that lets you raise `RE_MAX_WORKERS` without a source rate-limiting you). Turning
+`RE_MAX_WORKERS` up is the cheapest wall-clock upgrade; the per-host cap is what
+keeps that from turning into a denial-of-service attack on Wikipedia.
+
 ---
 
 ## 📄 What's in a report
@@ -398,7 +397,7 @@ Endpoints:
 |---------------|--------------|
 | `GET /health` | Liveness + version. |
 | `POST /research` | Runs a full session, returns the serialized session as JSON (blocking). |
-| `POST /research/stream` | Runs a session and **streams progress** as Server-Sent Events, ending with the full session. Powers the web UI. |
+| `POST /research/stream` | Runs a session and **streams progress live** as Server-Sent Events, ending with the full session. Powers the web app. |
 | `GET /docs` | Auto-generated Swagger UI (courtesy of FastAPI). |
 
 ```bash
@@ -418,36 +417,72 @@ worker thread), because a real run is blocking and can take a minute or two.
 It reuses the exact same engine as the CLI (via `service.run_research`), so
 whatever the CLI produces, the API produces — just JSON-shaped.
 
-The streaming endpoint (`POST /research/stream`) uses the engine's progress
-observer seam: a background thread runs the blocking engine while its `progress`
-reporter forwards each typed event (`PlanReady`, `IterationDone`, `AnswerReady`,
-…) onto the event loop, which emits them as SSE frames — then a terminal
-`SessionComplete` frame carries the full session (or an in-band `Error` frame).
-No research logic lives in the API; it's a thin adapter (ARCHITECTURE.md, Layer 1).
+The streaming sibling, **`POST /research/stream`**, is for humans who get bored.
+It rides the engine's *progress observer seam*: a background thread runs the
+(blocking) engine while its `progress` reporter forwards each typed event —
+`PlanReady`, `IterationDone`, `AnswerReady`, and friends — onto the event loop,
+which flushes them as SSE frames. The stream ends with a `SessionComplete` frame
+carrying the whole session (or an in-band `Error` frame, because a dropped
+connection is a rude way to learn something failed). No research logic lives in
+the API; it's a thin adapter that translates HTTP into `run_research` and back.
 
-## 🖥️ Web UI (optional)
+---
 
-A polished single-page app (`ui/`, React + Vite + Tailwind) drives the engine
-through the streaming API: type a question, watch the plan, iterations, and
-confidence build **live**, then explore the grounded result — the rendered
-report plus tabs for findings, verified claims, sources (with authority), the
-confidence breakdown, and any contradictions. Dark/light, responsive, no
-research logic in the client (it only calls the API).
+## 🖥️ Watch it think — the live terminal dashboard
+
+Same engine, but instead of a polite silence followed by a report, you get a
+**live animated dashboard**: progress bars that actually move, per-subquestion
+status, knowledge counts ticking up in real time (candidates → claims →
+corroborated), a confidence gauge that climbs as the evidence lands, and the
+full Markdown report rendered right there when it's done. It's the difference
+between "is this thing on?" and "oh, *there's* my research happening."
+
+```bash
+uv sync --extra tui                       # one dependency: Rich
+uv run research-engine-tui "Quantum Computing"
+```
+
+Piping the output somewhere non-interactive? It notices there's no real terminal
+and quietly degrades to the plain CLI, so your logs stay clean and your scripts
+stay scriptable. The engine core never imports Rich — the pretty stuff lives
+entirely in the `cli/` package (there's a test that enforces this, because
+architecture is a promise, not a vibe).
+
+---
+
+## 🌍 Use it in a browser — the web app
+
+For when you want to hand this to someone who has never met a terminal and never
+wants to. A polished single-page app (`ui/`, React + Vite + Tailwind) drives the
+engine through the streaming API: type a question, watch the plan appear, the
+iterations unfold, and the confidence bar climb **live** — then explore the
+grounded result. Not a dead spinner in sight.
+
+The result view is a small **evidence explorer**: the rendered report front and
+centre, plus tabs for Findings, verified Claims (filterable by whether they're
+corroborated, single-source, or contested), Sources (ranked by authority), a
+confidence breakdown, and any Contradictions. It very deliberately shows its
+work, because the whole point is that this *isn't* a chatbot confidently making
+things up — it's a machine that will show you its receipts and its doubts.
 
 ```bash
 # 1. Backend
-uv run research-engine-api           # http://127.0.0.1:8000
+uv sync --extra api && uv run research-engine-api      # http://127.0.0.1:8000
 
 # 2a. Development (hot reload; proxies API calls to :8000)
-cd ui && npm install && npm run dev  # http://localhost:5173
+cd ui && npm install && npm run dev                    # http://localhost:5173
 
-# 2b. Production (single command, no separate server)
-cd ui && npm run build               # emits ui/dist
-uv run research-engine-api           # now also serves the built UI at /
+# 2b. Production (one command serves everything)
+cd ui && npm run build                                 # emits ui/dist
+uv run research-engine-api                             # now also serves the UI at /
 ```
 
-When `ui/dist/` exists, the API serves it at `/` — so a built app is a
-one-command launch. Point the API elsewhere in dev with `VITE_API_TARGET`.
+When `ui/dist/` exists, the API serves it at `/`, so a built app is a
+one-command launch. The frontend contains **zero research logic** — it only ever
+asks the API nicely and renders what comes back (ARCHITECTURE.md, Layer 1: the
+UI is allowed to be pretty, not to think).
+
+---
 
 ## 🧪 Running the tests
 
@@ -455,11 +490,15 @@ one-command launch. Point the API elsewhere in dev with `VITE_API_TARGET`.
 uv run python -m unittest discover -s tests
 ```
 
-Stdlib `unittest`, no external runner, **168 tests**, all network-free (the
+Stdlib `unittest`, no external runner, **201 tests**, all network-free (the
 source providers are tested with injected fake fetchers, so the suite never
-actually hits Wikipedia). Covers every subsystem plus full offline end-to-end
-runs — including determinism across runs, gap-driven iteration, explicit stop
-reasons, and the agent loop's budget.
+actually hits Wikipedia — and now, thanks to the retry tests, it doesn't hit a
+*simulated* Wikipedia having a bad day either). Covers every subsystem plus full
+offline end-to-end runs — including determinism across runs, gap-driven
+iteration, explicit stop reasons, the agent loop's budget, and the v0.6
+additions: **parallel output proven byte-identical to sequential** (the whole
+point of the threading work), HTTP retry/backoff and the per-host concurrency
+cap, the progress observer seam, and the streaming API endpoint.
 
 ---
 
@@ -487,9 +526,10 @@ The evidence is real, cited, and now cross-checked — but let's not oversell it
   the importance filter then has to absorb. A stronger `OPENROUTER_MODEL` is
   the cheapest quality upgrade available.
 - **DuckDuckGo scraping is held together with optimism.** No official API; the
-  endpoint and markup can shift. Best-effort, fails closed. Wikipedia can also
-  rate-limit (HTTP 429) under multi-iteration runs; retry/backoff is queued
-  for the v0.6 networking pass.
+  endpoint and markup can shift. Best-effort, fails closed. (Wikipedia's habit
+  of rate-limiting under multi-iteration runs — HTTP 429 — was the debt that
+  v0.6 finally paid off: per-host concurrency caps plus `Retry-After`-aware
+  backoff. It no longer sulks when a source says "slow down.")
 - **Tokens cost money.** A live multi-iteration run spends LLM calls on
   planning, per-document extraction, borderline-pair judging, per-iteration
   synthesis, and the final answer (a measured 3-iteration run: ~53 calls).
@@ -499,6 +539,20 @@ These all live behind interfaces, so future-you can upgrade them without a
 rewrite. See *Technical Debt* in `TASKS.md`.
 
 ---
+
+## 🧭 Every version, at a glance
+
+For the impatient (the prose version, with feelings, is right below):
+
+| Version | Codename (unofficial) | What changed | The one-line why |
+|---------|----------------------|--------------|------------------|
+| **v0.1** | *The Mannequin* | End-to-end pipeline: plan → retrieve → download → extract → report. | Prove the plumbing works — even if the water is fake. |
+| **v0.2** | *Real Food* | Real sources (Wikipedia + arXiv + DuckDuckGo) + a real LLM pipeline. | Swap the synthetic evidence for the genuine article. |
+| **v0.3** | *The Critic* | Relevance filtering, source-authority scoring, passage selection, cross-source claim clustering, deterministic confidence. | Stop treating every sentence as equally true. |
+| **v0.4** | *Claims Take the Stage* | Plan-before-search, judge-before-download, **typed claims**, claim-vs-claim verification, evidence graph, direct answers, factor-by-factor confidence, the research loop. | Documents are containers; claims are the product. |
+| **v0.5** | *It Wakes Up* | One `ResearchState`, an always-on planner, curiosity → gap-driven searches, importance scores, knowledge-gain measurement, a stopping engine with a recorded reason. | A pipeline that learns beats a pipeline that runs. |
+| **v0.5.1** | *Bug Fixes With Receipts* | Structured-JSON output (verification stops choking) + subject-anchored gap queries and gate (no more topic drift). | Corroborate more than 0% of claims, and stay on topic. |
+| **v0.6** | *Cardio* | Fail-fast timeouts, multithreaded acquisition/extraction/reasoning (**determinism preserved**), per-host rate-limit backoff — plus a **live TUI** and a **web app** on a shared progress-observer seam. | Same brain, a third of the wall-clock, and two ways to watch it work. |
 
 ## 📜 The backstory
 
@@ -521,7 +575,7 @@ reasons over an evidence graph, answers questions directly, explains its
 confidence factor by factor, and loops back for more evidence when it isn't
 confident enough. The report finally has the nerve to leave sections out.
 
-**v0.5 (now)** turned the pipeline into an agent. One `ResearchState` holds
+**v0.5** turned the pipeline into an agent. One `ResearchState` holds
 everything; the planner never clocks out; curiosity converts what's missing
 (undefined entities, single-source claims, contradictions, low-authority
 evidence) into the next iteration's searches; every claim gets an importance
@@ -532,6 +586,44 @@ reason. Live-run diagnosis also fixed verification: rarity-weighted claim
 clustering plus an LLM equivalence judge for the borderline pairs plain
 lexical similarity can't decide — the difference between corroborating ~0% of
 claims and actually noticing when independent sources agree.
+
+**v0.5.1** was a bug-fix pass with receipts. A real grounded run had exposed two
+embarrassing habits. One: it was corroborating basically *nothing* — the
+equivalence judge kept getting handed unparseable JSON by a chatty model and
+quietly giving up. Two: it wandered off-topic, chasing gap queries that had
+forgotten what the research was even about. The fixes: turn on structured JSON
+output so the judge stops choking on prose, and anchor every gap query to the
+subject with a gate that rejects results sharing zero subject terms. Corroboration
+went from "0%, technically a number" to "actually works."
+
+**v0.6** is the performance version — same brain, much better cardio. A live run
+had spent **two-thirds of its wall-clock hanging on two stalled LLM requests**,
+each politely waiting out the OpenAI SDK's 600-second default timeout like it had
+nowhere to be. Fix #1: bound the timeout and the retries, so a stuck request
+fails fast to the deterministic fallback instead of taking a coffee break.
+Fix #2: the slow work is all I/O-bound (searches, downloads, per-document claim
+extraction, per-subquestion synthesis), so do it **on a thread pool** — with one
+non-negotiable rule: worker threads only fetch and return data, and a single
+thread merges results into `ResearchState` in fixed order. Offline output stays
+**byte-for-byte identical** whether you run it on 1 worker or 6; the speed is
+free, the determinism is sacred. Fix #3 (the `T90` networking pass): a per-host
+concurrency cap and `Retry-After`-aware exponential backoff in the shared HTTP
+layer, so cranking up the worker count doesn't just translate "faster" into
+"Wikipedia 429s you into oblivion."
+
+**The two faces (also v0.6).** The engine grew a UI department — two of them,
+both strictly presentation, neither allowed anywhere near the research logic.
+First, a **live terminal dashboard** (`research-engine-tui`, built on Rich):
+animated progress, real-time knowledge counts, a climbing confidence gauge, and
+the full report at the end — because eleven minutes of blank terminal is a
+usability crime. Both rode in on a tiny, reusable addition to the engine: an
+**observer seam**, an optional `progress` callback that emits typed events at
+each checkpoint and changes nothing about the results (a broken observer can't
+corrupt a run; it just gets logged and ignored). Then the same seam powered a
+**web app** (`ui/`, React + Vite + Tailwind) that streams the investigation to a
+browser over Server-Sent Events and lays the result out as a proper evidence
+explorer. One seam, two audiences, zero research logic in either — exactly how
+Layer 1 was always supposed to work.
 
 ---
 
