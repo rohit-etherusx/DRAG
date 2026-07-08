@@ -625,11 +625,4 @@ browser over Server-Sent Events and lays the result out as a proper evidence
 explorer. One seam, two audiences, zero research logic in either — exactly how
 Layer 1 was always supposed to work.
 
----
 
-## 🗺️ Source of truth
-
-This repo governs itself with documents. `PROJECT.md` (the vision), `ARCHITECTURE.md`
-(the design), `OBJECTIVE.md` (the current milestone — owner-owned), and `TASKS.md`
-(engineer-owned implementation status). When in doubt, those win over this README.
-This README is just the one that's allowed to have fun.
