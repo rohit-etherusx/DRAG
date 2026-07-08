@@ -1,0 +1,42 @@
+# Keep the build context small and secrets out of the image.
+
+# VCS
+.git
+.gitattributes
+
+# Python envs / caches / build output
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+wheels/
+
+# Frontend deps & build (both are recreated inside the image)
+ui/node_modules/
+ui/dist/
+ui/.vite/
+
+# Runtime + generated research artifacts (mount a volume instead)
+.run/
+report/
+sessions/
+
+# Secrets & local config — NEVER bake these into the image; pass at runtime
+.env
+.env.*
+!.env.example
+
+# Docker / editor / OS noise
+Dockerfile
+.dockerignore
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Docs not needed at runtime (README.md is kept — pyproject references it)
+*.md
+!README.md

@@ -7,6 +7,9 @@
 /report/
 /sessions/
 
+# ---- start-engine.sh runtime (pids + logs) ----
+/.run/
+
 # ---- Python bytecode / caches ----
 __pycache__/
 *.py[cod]
