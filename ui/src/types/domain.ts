@@ -38,6 +38,7 @@ export interface Claim {
   text: string;
   claim_type: ClaimType;
   entities: string[];
+  evidence_ids: string[];
   source_ids: string[];
   subquestion_ids: string[];
   supporting_sources: number;
@@ -47,6 +48,53 @@ export interface Claim {
   status: VerificationStatus;
   confidence: number;
   confidence_explanation: string;
+  /** Deterministic 0..1 importance to the objective (stamped by reasoning). */
+  importance: number;
+}
+
+/** A relevant passage extracted from a document — a claim's provenance. */
+export interface Evidence {
+  id: string;
+  passage: string;
+  document_id: string;
+  source_id: string;
+  subquestion_id: string;
+  relevance_score: number;
+}
+
+export type GapKind =
+  | "missing_evidence"
+  | "uncorroborated"
+  | "missing_definition"
+  | "missing_relationship"
+  | "contradiction"
+  | "missing_primary_source";
+
+/** A piece of missing knowledge the curiosity engine discovered. */
+export interface KnowledgeGap {
+  id: string;
+  kind: GapKind;
+  description: string;
+  suggested_query: string;
+  subquestion_id: string;
+  entity: string;
+  priority: number;
+  /** Whether the planner turned this gap into a search task. */
+  investigated: boolean;
+}
+
+/** What one research-loop iteration contributed to the knowledge model. */
+export interface IterationRecord {
+  iteration: number;
+  search_tasks: number;
+  documents_downloaded: number;
+  claims_before: number;
+  claims_after: number;
+  corroborated: number;
+  novelty: number;
+  knowledge_gain: number;
+  confidence: number;
+  gaps_open: number;
 }
 
 export interface Finding {
@@ -129,16 +177,22 @@ export interface ResearchSession {
   provider_info: Record<string, string>;
   plan: ResearchPlan | null;
   sources: Source[];
+  evidence: Evidence[];
   claims: Claim[];
   findings: Finding[];
   hypotheses: Hypothesis[];
   contradictions: Contradiction[];
   direct_answer: string;
   answer: Answer | null;
+  patterns: string[];
+  missing_evidence: string[];
   open_questions: string[];
   suggestions: string[];
   confidence: ConfidenceReport | null;
   overall_confidence: number;
+  /** Every gap curiosity discovered — investigated or still open. */
+  knowledge_gaps: KnowledgeGap[];
+  iteration_records: IterationRecord[];
   stop_reason: string;
   iterations: number;
   candidates_evaluated: number;

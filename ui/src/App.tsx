@@ -1,6 +1,6 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ProgressEvent, ResearchParams, ResearchSession } from "./types/domain";
-import { streamResearch } from "./lib/api";
+import { checkHealth, streamResearch } from "./lib/api";
 import { SearchForm } from "./components/SearchForm";
 import { RunProgress } from "./components/RunProgress";
 import { Results } from "./components/Results";
@@ -13,7 +13,24 @@ export default function App() {
   const [events, setEvents] = useState<ProgressEvent[]>([]);
   const [session, setSession] = useState<ResearchSession | null>(null);
   const [error, setError] = useState<string>("");
+  const [version, setVersion] = useState<string>("");
   const abortRef = useRef<AbortController | null>(null);
+
+  // Stamp the running engine's version in the masthead. Best-effort: the UI is
+  // fully usable if the probe fails (e.g. backend still starting).
+  useEffect(() => {
+    let cancelled = false;
+    checkHealth()
+      .then((h) => {
+        if (!cancelled) setVersion(h.version);
+      })
+      .catch(() => {
+        /* no badge, no problem */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const start = useCallback(async (params: ResearchParams) => {
     const controller = new AbortController();
@@ -55,24 +72,48 @@ export default function App() {
   }, []);
 
   return (
-    <div className="app-aurora min-h-full">
-      <header className="sticky top-0 z-10 border-b border-border bg-bg/70 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
+    <div className="app-paper flex min-h-full flex-col">
+      <header className="sticky top-0 z-20 border-b-[1.5px] border-border bg-bg/90 backdrop-blur">
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3">
           <button
             type="button"
             onClick={reset}
-            className="flex items-center gap-2 text-sm font-semibold text-text"
+            className="group flex items-center gap-2"
+            title="Start over"
           >
-            <span className="grid h-7 w-7 place-items-center rounded-lg bg-gradient-to-br from-accent to-accent2 text-accentfg">
-              ◈
+            <svg
+              width="20"
+              height="24"
+              viewBox="0 0 40 50"
+              className="shrink-0 text-border"
+              aria-hidden="true"
+            >
+              <g stroke="currentColor" strokeWidth="3" strokeLinejoin="round">
+                <path d="M2.5 2.5h23l12 12v33.5H2.5z" fill="var(--color-p-pink)" />
+                <path d="M25.5 2.5v12h12" fill="none" />
+                <path d="M10 27h20M10 35h13" strokeLinecap="round" />
+              </g>
+            </svg>
+            <span className="text-sm font-bold lowercase tracking-tight">
+              research<span className="text-accent">-</span>engine
             </span>
-            Research Engine
+            {version && (
+              <span className="border-[1.5px] border-border bg-text px-1 py-px text-[10px] font-bold tabular-nums text-surface">
+                v{version}
+              </span>
+            )}
           </button>
-          <ThemeToggle />
+
+          <div className="flex items-center gap-2">
+            <span className="hidden text-[11px] lowercase text-muted sm:inline">
+              grounded · cited · confidence-scored
+            </span>
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 
-      <main className="px-4 py-10 sm:py-14">
+      <main className="flex-1 px-4 py-10 sm:py-14">
         {phase === "idle" && <SearchForm onSubmit={start} />}
 
         {phase === "running" && <RunProgress events={events} onCancel={reset} />}
@@ -82,25 +123,32 @@ export default function App() {
         )}
 
         {phase === "error" && (
-          <div className="rise mx-auto max-w-lg text-center">
-            <div className="mb-4 text-4xl">⚠</div>
-            <h2 className="mb-2 text-xl font-semibold text-text">
-              Research could not complete
-            </h2>
-            <p className="mb-6 text-sm text-muted">{error}</p>
-            <button
-              type="button"
-              onClick={reset}
-              className="rounded-xl bg-accent px-5 py-2.5 text-sm font-semibold text-accentfg transition hover:opacity-90"
-            >
-              Try again
-            </button>
+          <div className="rise mx-auto max-w-lg">
+            <div className="sheet lift-6 relative p-6 text-center">
+              <span className="stamp absolute -top-3 right-4 border-[1.5px] border-danger px-2 py-0.5 text-[11px] font-bold lowercase tracking-widest text-danger">
+                failed
+              </span>
+              <h2 className="display display-sm mb-3 text-2xl lowercase">
+                run did not complete
+              </h2>
+              <p className="mb-6 break-words border-[1.5px] border-dashed border-border bg-surface2 p-3 text-left text-xs text-muted">
+                {error}
+              </p>
+              <button type="button" onClick={reset} className="btn-ink px-5 py-2.5 text-sm">
+                start over
+              </button>
+            </div>
           </div>
         )}
       </main>
 
-      <footer className="border-t border-border py-6 text-center text-xs text-muted">
-        Grounded · cited · confidence-scored — not a chatbot.
+      <footer className="border-t-[1.5px] border-border px-4 py-5">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-2 text-[11px] lowercase text-muted">
+          <span>
+            knowledge is the product — the report is one rendering of it
+          </span>
+          <span>not a chatbot</span>
+        </div>
       </footer>
     </div>
   );

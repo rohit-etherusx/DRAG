@@ -3,7 +3,8 @@ import { createRoot } from "react-dom/client";
 import App from "./App.tsx";
 import "./index.css";
 
-// Restore the saved theme before first paint (index.html defaults to dark).
+// Restore the saved theme before first paint. The default is the paper (light)
+// theme; `.dark` switches the whole sheet to carbon.
 try {
   const saved = localStorage.getItem("re-theme");
   if (saved) {

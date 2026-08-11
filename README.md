@@ -461,9 +461,19 @@ grounded result. Not a dead spinner in sight.
 The result view is a small **evidence explorer**: the rendered report front and
 centre, plus tabs for Findings, verified Claims (filterable by whether they're
 corroborated, single-source, or contested), Sources (ranked by authority), a
-confidence breakdown, and any Contradictions. It very deliberately shows its
-work, because the whole point is that this *isn't* a chatbot confidently making
-things up — it's a machine that will show you its receipts and its doubts.
+confidence breakdown, Contradictions, and the knowledge gaps the curiosity engine
+found (marked closed or still open). It very deliberately shows its work, because
+the whole point is that this *isn't* a chatbot confidently making things up —
+it's a machine that will show you its receipts and its doubts.
+
+**The look is deliberate: paper.** The engine produces printed research
+artifacts, so the interface is themed as one — an off-white ruled desk, white
+sheets with hard ink hairlines and flat offset shadows, monospaced type, boxed
+step numbers, segmented gauges instead of glowing bars, and a printed serif for
+report prose. The visual grammar maps onto the domain model: one sheet per unit
+of knowledge, an ink rule around anything separately citable, a coral mark on
+every measured value. A `.dark` toggle re-themes the whole thing as carbon paper
+from a single set of tokens.
 
 ```bash
 # 1. Backend

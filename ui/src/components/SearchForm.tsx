@@ -1,11 +1,13 @@
 import { useState } from "react";
 import type { ResearchParams } from "../types/domain";
 import { cn } from "../lib/format";
+import { PaperDocs, StepChip } from "./ui/primitives";
 
 const EXAMPLES = [
   "What limits the scalability of quantum error correction?",
   "Impact of intermittent fasting on metabolic health",
   "Transformer architectures for time-series forecasting",
+  "Trade-offs of solid-state batteries",
 ];
 
 export function SearchForm({
@@ -38,84 +40,93 @@ export function SearchForm({
   }
 
   return (
-    <div className="rise mx-auto w-full max-w-2xl">
-      <div className="mb-8 text-center">
-        <h1 className="bg-gradient-to-r from-accent to-accent2 bg-clip-text text-4xl font-bold tracking-tight text-transparent sm:text-5xl">
-          Research Engine
+    <div className="rise mx-auto w-full max-w-3xl">
+      {/* Masthead */}
+      <div className="mb-10 text-center">
+        <h1 className="display text-4xl lowercase sm:text-5xl">
+          from question to
+          <br />
+          verified answer
         </h1>
-        <p className="mx-auto mt-3 max-w-md text-balance text-muted">
-          Ask a question or name a topic. The engine plans, searches, verifies
-          across sources, and returns a grounded, cited report.
+        <p className="mx-auto mt-5 max-w-xl text-sm leading-relaxed text-muted">
+          plans the investigation, searches, extracts typed claims, verifies them
+          across independent sources — and stops when it has learned enough
         </p>
       </div>
 
-      <div className="rounded-2xl border border-border bg-surface p-2 shadow-lg shadow-black/5 focus-within:border-accent">
+      {/* The query sheet */}
+      <div className="sheet sheet-focus lift-6">
         <textarea
           value={topic}
           onChange={(e) => setTopic(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit();
           }}
-          placeholder="e.g. What are the trade-offs of solid-state batteries?"
+          placeholder="ask a question, or name a topic…"
           rows={3}
           disabled={disabled}
-          className="w-full resize-none bg-transparent px-4 py-3 text-base text-text outline-none placeholder:text-muted"
+          autoFocus
+          className="w-full resize-none bg-transparent px-4 py-3.5 text-[15px] text-text outline-none placeholder:lowercase placeholder:text-muted"
         />
-        <div className="flex items-center justify-between gap-3 px-2 pb-1">
+
+        <div className="flex items-center justify-between gap-3 border-t-[1.5px] border-border px-3 py-2.5">
           <button
             type="button"
             onClick={() => setShowAdvanced((s) => !s)}
-            className="rounded-lg px-2 py-1.5 text-sm text-muted transition hover:text-text"
+            className="flex items-center gap-1.5 px-1 text-xs lowercase text-muted transition hover:text-text"
+            aria-expanded={showAdvanced}
           >
-            {showAdvanced ? "▾ Options" : "▸ Options"}
+            <span className="inline-block w-3 text-center">
+              {showAdvanced ? "▾" : "▸"}
+            </span>
+            options
           </button>
           <button
             type="button"
             onClick={submit}
             disabled={!canSubmit}
-            className={cn(
-              "inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-sm font-semibold transition",
-              canSubmit
-                ? "bg-accent text-accentfg hover:opacity-90 active:scale-[0.98]"
-                : "cursor-not-allowed bg-surface2 text-muted",
-            )}
+            className="btn-ink px-6 py-2 text-sm lowercase"
           >
-            Research <span className="opacity-70">↵</span>
+            research
+            <span className="text-[11px] opacity-60">⌘↵</span>
           </button>
         </div>
 
         {showAdvanced && (
-          <div className="rise mt-1 grid grid-cols-1 gap-4 border-t border-border px-3 pb-3 pt-4 sm:grid-cols-3">
-            <Slider
-              label="Research angles"
+          <div className="rise grid grid-cols-1 gap-x-6 gap-y-4 border-t-[1.5px] border-dashed border-border bg-surface2 px-4 py-4 sm:grid-cols-3">
+            <Stepper
+              label="research angles"
+              hint="subquestions the planner decomposes into"
               value={maxSubtopics}
               min={1}
               max={7}
               onChange={setMaxSubtopics}
             />
-            <Slider
-              label="Docs per angle"
+            <Stepper
+              label="docs per angle"
+              hint="accepted candidates downloaded per angle"
               value={docsPerQuery}
               min={1}
               max={10}
               onChange={setDocsPerQuery}
             />
-            <Slider
-              label="Max iterations"
+            <Stepper
+              label="max iterations"
+              hint="search budget for the research loop"
               value={maxIterations}
               min={1}
               max={10}
               onChange={setMaxIterations}
             />
             <div className="col-span-full flex flex-wrap gap-2">
-              <Toggle
-                label="Offline sources"
+              <Check
+                label="offline sources"
                 hint="Deterministic local knowledge — no network"
                 checked={offline}
                 onChange={setOffline}
               />
-              <Toggle
-                label="No LLM"
+              <Check
+                label="no llm"
                 hint="Deterministic synthesis only — no model calls"
                 checked={noLlm}
                 onChange={setNoLlm}
@@ -125,55 +136,83 @@ export function SearchForm({
         )}
       </div>
 
-      <div className="mt-6 flex flex-wrap justify-center gap-2">
-        {EXAMPLES.map((ex) => (
-          <button
-            key={ex}
-            type="button"
-            disabled={disabled}
-            onClick={() => setTopic(ex)}
-            className="rounded-full border border-border bg-surface px-3 py-1.5 text-xs text-muted transition hover:border-accent hover:text-text disabled:opacity-50"
-          >
-            {ex}
-          </button>
-        ))}
+      {/* Example ticker */}
+      <div className="mt-8 border-y-[1.5px] border-border py-2.5">
+        <div className="flex items-center gap-3 overflow-x-auto text-xs text-muted [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          <span className="shrink-0 font-bold lowercase text-text">try</span>
+          {EXAMPLES.map((ex, i) => (
+            <span key={ex} className="flex shrink-0 items-center gap-3">
+              {i > 0 && (
+                <span className="h-1.5 w-1.5 shrink-0 bg-text" aria-hidden="true" />
+              )}
+              <button
+                type="button"
+                disabled={disabled}
+                onClick={() => setTopic(ex)}
+                className="whitespace-nowrap lowercase transition hover:text-text hover:underline hover:decoration-accent hover:decoration-2 hover:underline-offset-4 disabled:opacity-50"
+              >
+                {ex}
+              </button>
+            </span>
+          ))}
+        </div>
       </div>
+
+      <PaperDocs className="mt-6 -mb-4" />
     </div>
   );
 }
 
-function Slider({
+/** A square [−]/[+] spinner. Reads like a form printed on the page. */
+function Stepper({
   label,
+  hint,
   value,
   min,
   max,
   onChange,
 }: {
   label: string;
+  hint: string;
   value: number;
   min: number;
   max: number;
   onChange: (v: number) => void;
 }) {
   return (
-    <label className="flex flex-col gap-1.5">
-      <span className="flex items-center justify-between text-xs text-muted">
+    <div className="flex flex-col gap-1.5">
+      <span className="text-[11px] lowercase text-muted" title={hint}>
         {label}
-        <span className="font-semibold tabular-nums text-text">{value}</span>
       </span>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        className="accent-[var(--accent)]"
-      />
-    </label>
+      <div className="flex items-stretch">
+        <button
+          type="button"
+          onClick={() => onChange(Math.max(min, value - 1))}
+          disabled={value <= min}
+          className="btn-paper h-8 w-8 text-sm disabled:opacity-40"
+          aria-label={`decrease ${label}`}
+        >
+          −
+        </button>
+        <span className="grid h-8 min-w-10 flex-1 place-items-center border-y-[1.5px] border-border bg-surface text-sm font-bold tabular-nums">
+          {value}
+        </span>
+        <button
+          type="button"
+          onClick={() => onChange(Math.min(max, value + 1))}
+          disabled={value >= max}
+          className="btn-paper h-8 w-8 text-sm disabled:opacity-40"
+          aria-label={`increase ${label}`}
+        >
+          +
+        </button>
+      </div>
+    </div>
   );
 }
 
-function Toggle({
+/** A square checkbox with a mono tick. */
+function Check({
   label,
   hint,
   checked,
@@ -189,21 +228,13 @@ function Toggle({
       type="button"
       onClick={() => onChange(!checked)}
       title={hint}
+      aria-pressed={checked}
       className={cn(
-        "inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition",
-        checked
-          ? "border-accent bg-accent/10 text-text"
-          : "border-border bg-surface text-muted hover:text-text",
+        "inline-flex items-center gap-2 border-[1.5px] border-border px-3 py-1.5 text-xs lowercase transition",
+        checked ? "bg-text text-surface" : "bg-surface text-muted hover:text-text",
       )}
     >
-      <span
-        className={cn(
-          "grid h-4 w-4 place-items-center rounded border text-[10px]",
-          checked ? "border-accent bg-accent text-accentfg" : "border-border",
-        )}
-      >
-        {checked ? "✓" : ""}
-      </span>
+      <StepChip n={checked ? "✓" : " "} variant="paper" />
       {label}
     </button>
   );
